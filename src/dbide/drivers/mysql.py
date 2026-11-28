@@ -47,6 +47,17 @@ class MySQLDriver(Driver):
             connect_args["ssl"] = {"check_hostname": False}
         return {"pool_pre_ping": True, "pool_recycle": 3600, "connect_args": connect_args}
 
+    schema_required = True
+
+    def default_schema(self, cfg) -> str | None:
+        return cfg.database or None  # in MySQL a "database" is the schema
+
+    def use_schema_sql(self, schema: str) -> str | None:
+        return f"USE {self.quote(schema)}"
+
+    def insert_default_row_sql(self, qualified_table: str) -> str:
+        return f"INSERT INTO {qualified_table} () VALUES ()"
+
     def connection_id(self, conn: Connection):
         return conn.exec_driver_sql("SELECT CONNECTION_ID()").scalar()
 

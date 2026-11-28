@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 import sqlglot
 from sqlglot import exp
 
-DIALECTS = {"sqlite": "sqlite", "mysql": "mysql"}
+DIALECTS = {"sqlite": "sqlite", "mysql": "mysql", "postgresql": "postgres", "mssql": "tsql"}
 
 
 @dataclass
@@ -288,10 +288,13 @@ def extract_joins(sql: str, dialect: str = "sqlite") -> JoinAnalysis | None:
     return JoinAnalysis(tables, steps)
 
 
-def join_stat_queries(step: JoinStep, quote, qualify) -> dict[str, str] | None:
+def join_stat_queries(step: JoinStep, quote, qualify, limit_fn=None) -> dict[str, str] | None:
     """SQL that counts matched and unmatched rows for one join step (pairwise)."""
     if not step.left or not step.on_sql:
         return None
+
+    def lim(sql: str, n: int) -> str:
+        return limit_fn(sql, n) if limit_fn else f"{sql} LIMIT {n}"
     L = f"{qualify(step.left.name, step.left.schema)} AS {quote(step.left.alias)}"
     R = f"{qualify(step.right.name, step.right.schema)} AS {quote(step.right.alias)}"
     on = step.on_sql
@@ -301,9 +304,9 @@ def join_stat_queries(step: JoinStep, quote, qualify) -> dict[str, str] | None:
         "left_unmatched": f"SELECT COUNT(*) FROM {L} WHERE NOT EXISTS (SELECT 1 FROM {R} WHERE {on})",
         "right_unmatched": f"SELECT COUNT(*) FROM {R} WHERE NOT EXISTS (SELECT 1 FROM {L} WHERE {on})",
         "inner_rows": f"SELECT COUNT(*) FROM {L} JOIN {R} ON {on}",
-        "left_sample": f"SELECT * FROM {L} WHERE NOT EXISTS (SELECT 1 FROM {R} WHERE {on}) LIMIT 5",
-        "right_sample": f"SELECT * FROM {R} WHERE NOT EXISTS (SELECT 1 FROM {L} WHERE {on}) LIMIT 5",
-        "matched_sample": f"SELECT * FROM {L} JOIN {R} ON {on} LIMIT 5",
+        "left_sample": lim(f"SELECT * FROM {L} WHERE NOT EXISTS (SELECT 1 FROM {R} WHERE {on})", 5),
+        "right_sample": lim(f"SELECT * FROM {R} WHERE NOT EXISTS (SELECT 1 FROM {L} WHERE {on})", 5),
+        "matched_sample": lim(f"SELECT * FROM {L} JOIN {R} ON {on}", 5),
     }
 
 

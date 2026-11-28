@@ -4,8 +4,9 @@ from dataclasses import replace
 
 import shiboken6
 from PySide6.QtCore import QByteArray, QSize, Qt, QTimer
-from PySide6.QtGui import QAction, QGuiApplication, QKeySequence
+from PySide6.QtGui import QAction, QActionGroup, QGuiApplication, QKeySequence
 from PySide6.QtWidgets import (
+    QDialog,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -45,7 +46,12 @@ from dbide.ui.security_dialogs import PasswordToolDialog, SecuritySettingsDialog
 from dbide.ui.schema_tree import SchemaTree
 from dbide.ui.table_builder import TableBuilderTab
 from dbide.ui.theme import ThemeManager
-from dbide.ui.worker import run_async
+from dbide.core import playground as P
+from dbide.core.progress import progress
+from dbide.core.templates import TEMPLATES, apply_template
+from dbide.ui.features import Gate, LevelToast
+from dbide.ui.progress_panel import ProgressPanel
+from dbide.ui.worker import connect_owned, run_async
 
 
 class Tabs(QTabWidget):
@@ -91,8 +97,8 @@ def _panel_header(title: str, buttons: list[tuple[str, str, object]]) -> tuple[Q
 class Card(QFrame):
     """A clickable card for the welcome page."""
 
-    def __init__(self, icon: str, title: str, text: str, on_click):
-        super().__init__()
+    def __init__(self, icon: str, title: str, text: str, on_click, parent=None):
+        super().__init__(parent)
         self.setObjectName("Card")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.on_click = on_click
@@ -142,7 +148,11 @@ class FlowGrid(QWidget):
     def set_items(self, items: list[QWidget]) -> None:
         for w in self.items:
             self.grid.removeWidget(w)
-            w.setParent(None)
+            w.hide()
+            w.deleteLater()  # detaching with setParent(None) would leave stray top-level windows behind
+        for w in items:
+            if w.parent() is not self:
+                w.setParent(self)
         self.items = items
         self._cols = 0
         self._reflow()
@@ -175,9 +185,9 @@ class MainWindow(QMainWindow):
         self.resize(1400, 860)
         self.setMinimumSize(640, 420)
         self.manager = manager or ConnectionManager()
-        self.manager.failed.connect(self._connect_failed)
-        self.manager.connected.connect(self._connected)
-        self.manager.disconnected.connect(lambda _: self._update_status())
+        connect_owned(self.manager.failed, self, self._connect_failed)
+        connect_owned(self.manager.connected, self, self._connected)
+        connect_owned(self.manager.disconnected, self, lambda _: self._update_status())
         tm = ThemeManager.get()
         if not tm._applied:
             tm.apply()
@@ -217,8 +227,17 @@ class MainWindow(QMainWindow):
         lh, _ = _panel_header("Lessons", [("sidebar", "Hide sidebar (⌘B)", lambda: self.set_sidebar(False))])
         ll.addWidget(lh)
         ll.addWidget(self.lesson_panel, 1)
+        progress_page = QWidget()
+        pl = QVBoxLayout(progress_page)
+        pl.setContentsMargins(0, 0, 0, 0)
+        pl.setSpacing(0)
+        ph_, _ = _panel_header("Your Progress", [("sidebar", "Hide sidebar (⌘B)", lambda: self.set_sidebar(False))])
+        pl.addWidget(ph_)
+        self.progress_panel = ProgressPanel()
+        pl.addWidget(self.progress_panel, 1)
         self.side_stack.addWidget(conn_page)
         self.side_stack.addWidget(lesson_page)
+        self.side_stack.addWidget(progress_page)
         self.side_panel = QWidget()
         self.side_panel.setObjectName("SidePanel")
         sp = QVBoxLayout(self.side_panel)
@@ -257,7 +276,9 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
 
         self._practice_waiters: list = []
-        self.manager.connected.connect(self._practice_connected)
+        self._conn_waiters: dict[str, list] = {}
+        connect_owned(self.manager.connected, self, self._practice_connected)
+        connect_owned(self.manager.connected, self, self._run_conn_waiters)
         self._want_side = True
         self._want_help = bool(settings().get("help_panel_open") if settings().get("help_panel_open") is not None else True)
         self._help_forced_at: int | None = None
@@ -274,12 +295,18 @@ class MainWindow(QMainWindow):
         sizes = settings().get("splitter_sizes")
         self._restored_sizes = sizes if isinstance(sizes, list) and len(sizes) == 3 else None
         hc = HelpCenter.get()
-        hc.beginner_changed.connect(self._beginner_changed)
+        connect_owned(hc.mode_changed, self, self._mode_changed)
         tm.on_change(self, lambda _t: self._update_status())
         if hc.beginner:
             self._want_help = True
-        if not self.manager.store.all():
-            self.show_lessons()  # first launch: offer the lessons
+        else:
+            self._want_help = False  # power users open help when they want it (the ? button / ⌘⌥H)
+        gate = Gate.get()
+        gate.on(gate.level_up, self, self._level_up)
+        self._apply_mode(initial=True)
+        if not settings().get("first_run_done"):
+            settings().set("first_run_done", True)
+            QTimer.singleShot(0, self._first_run)
         self._apply_responsive()
         QTimer.singleShot(0, self._unlock_secrets)
 
@@ -305,8 +332,10 @@ class MainWindow(QMainWindow):
             self.activity_buttons[key] = b
             return b
 
+        button("playground", "ph.flask", "Playground: safe sample data (⌘⇧P)", lambda: self.open_playground(), checkable=False)
         button("connections", "connections", "Connections (⌘1)", lambda: self._activity("connections"))
         button("lessons", "lessons", "Lessons (F1)", lambda: self._activity("lessons"))
+        button("progress", "ph.trophy", "Your progress and unlocked tools", lambda: self._activity("progress"))
         lay.addStretch()
         button("help", "help", "Help panel (⌘⌥H)", lambda: self.set_help(not self.right_panel.isVisible(), user=True))
         button("mode", "moon", "Switch light / dark", lambda: ThemeManager.get().toggle_mode(), checkable=False)
@@ -316,11 +345,13 @@ class MainWindow(QMainWindow):
         mode_btn.setIcon(tm.icon("sun" if tm.theme.dark else "moon", "muted"))
         tag(self.activity_buttons["connections"], "cmd:new_connection")
         tag(self.activity_buttons["lessons"], "cmd:lessons")
+        tag(self.activity_buttons["playground"], "cmd:playground")
+        tag(self.activity_buttons["progress"], "cmd:progress")
         tag(self.activity_buttons["appearance"], "cmd:appearance")
         return bar
 
     def _activity(self, key: str) -> None:
-        page = {"connections": 0, "lessons": 1}[key]
+        page = {"connections": 0, "lessons": 1, "progress": 2}[key]
         if self.side_panel.isVisible() and self.side_stack.currentIndex() == page:
             self.set_sidebar(False)  # clicking the active icon folds the sidebar, like VS Code
         else:
@@ -395,13 +426,14 @@ class MainWindow(QMainWindow):
         self.status_chip.setTextFormat(Qt.TextFormat.RichText)
         self.zoom_label = QLabel()
         self.zoom_label.setObjectName("Muted")
-        self.beginner_badge = QLabel("Beginner mode")
-        self.beginner_badge.setObjectName("Badge")
-        self.beginner_badge.setToolTip("Extra explanations and safety checks are on (View → Beginner Mode)")
-        sb.addPermanentWidget(self.beginner_badge)
+        self.mode_badge = QLabel()
+        self.mode_badge.setObjectName("Badge")
+        self.mode_badge.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.mode_badge.mousePressEvent = lambda _e: self.mode_button.showMenu()  # type: ignore[method-assign]
+        sb.addPermanentWidget(self.mode_badge)
         sb.addPermanentWidget(self.zoom_label)
         sb.addPermanentWidget(self.status_chip)
-        self.beginner_badge.setVisible(HelpCenter.get().beginner)
+
 
     # ---- welcome page ----------------------------------------------------------
     def _welcome_widget(self) -> QWidget:
@@ -428,13 +460,20 @@ class MainWindow(QMainWindow):
         start.setObjectName("PanelTitle")
         lay.addWidget(start)
         cards = FlowGrid(250)
+        self._welcome_cards = cards
         cards.set_items([
-            Card("connect", "New connection", "Connect to a MySQL server or open / create a SQLite file.", self.new_connection),
-            Card("lessons", "Learn databases", "Five guided lessons on a practice database: tables, keys, JOINs, passwords, media.", self.show_lessons),
-            Card("query", "New query", "Open a SQL editor for the selected connection (⌘T).", lambda: self.new_query()),
-            Card("appearance", "Appearance", "Light or dark mode, themes, accent colour, fonts and zoom.", self.appearance_settings),
+            Card("ph.flask", "Playground", "Try SQL on realistic sample data. Nothing can break, and every change can be undone.", lambda: self.open_playground(), cards),
+            Card("ph.squares-four", "Start from a template", "Online store, blog, school, library, tasks or recipes: tables, keys and sample data ready to go.", lambda: self.templates_dialog(), cards),
+            Card("connect", "New connection", "Connect to a MySQL server or open / create a SQLite file.", self.new_connection, cards),
+            Card("lessons", "Learn databases", "Ten guided lessons: tables, keys and JOINs, then the DBA essentials: indexes, transactions, backups, permissions.", self.show_lessons, cards),
+            Card("security", "Admin Console", "Health checks, Analyze, Vacuum/Optimize, backups, running queries, users and grants.", lambda: self._admin_here(), cards),
+            Card("query", "New query", "Open a SQL editor for the selected connection (⌘T).", lambda: self.new_query(), cards),
+            Card("appearance", "Appearance", "Light or dark mode, themes, accent colour, fonts and zoom.", self.appearance_settings, cards),
         ])
         lay.addWidget(cards)
+        by_title = {c.findChild(QLabel, "CardTitle").text(): c for c in cards.items}
+        self._learning_cards = [by_title[t] for t in ("Playground", "Learn databases") if t in by_title]
+        self._power_cards = [by_title[t] for t in ("Admin Console",) if t in by_title]
         lay.addSpacing(16)
         self._recent_title = QLabel("Saved connections")
         self._recent_title.setObjectName("PanelTitle")
@@ -458,13 +497,20 @@ class MainWindow(QMainWindow):
     def _fill_recent(self) -> None:
         if not hasattr(self, "_recent"):
             return
+        configs = self.manager.store.all()[:8]
+        signature = [(c.id, c.name, c.database, c.host) for c in configs]
+        if signature == getattr(self, "_recent_signature", None):
+            return  # nothing changed: don't rebuild the cards
+        self._recent_signature = signature
         items = []
-        for cfg in self.manager.store.all()[:8]:
+        for cfg in configs:
             icon = "database" if cfg.driver != "sqlite" else "table"
             from pathlib import Path
 
-            summary = f"SQLite · {Path(cfg.database).name}" if cfg.driver == "sqlite" else f"MySQL · {cfg.summary()}"
-            items.append(Card(icon, cfg.name, summary, lambda cid=cfg.id: self.connect_profile(cid)))
+            from dbide.drivers import get_driver
+
+            summary = f"SQLite · {Path(cfg.database).name}" if cfg.driver == "sqlite" else f"{get_driver(cfg.driver).label} · {cfg.summary()}"
+            items.append(Card(icon, cfg.name, summary, lambda cid=cfg.id: self.connect_profile(cid), parent=self._recent))
         self._recent.set_items(items)
         self._recent_title.setVisible(bool(items))
         self._recent.setVisible(bool(items))
@@ -474,9 +520,11 @@ class MainWindow(QMainWindow):
         mb = self.menuBar()
         tm = ThemeManager.get()
 
-        def act(menu, text, slot, shortcut=None, icon=None):
+        gate = Gate.get()
+
+        def act(menu, text, slot, shortcut=None, icon=None, feature=None):
             a = QAction(text, self)
-            a.triggered.connect(slot)
+            a.triggered.connect(gate.guarded(feature, slot, self) if feature else slot)
             if shortcut:
                 a.setShortcut(QKeySequence(shortcut))
             if icon:
@@ -487,6 +535,8 @@ class MainWindow(QMainWindow):
         f = mb.addMenu("&File")
         self.new_conn_act = act(f, "New Connection…", self.new_connection, "Ctrl+N", "connect")
         self.new_query_act = act(f, "New Query", lambda: self.new_query(), "Ctrl+T", "query")
+        self.template_act = act(f, "New Project from Template…", lambda: self.templates_dialog(), "Ctrl+Shift+N", "ph.squares-four")
+        self.playground_act = act(f, "Open Playground", lambda: self.open_playground(), "Ctrl+Shift+P", "ph.flask")
         act(f, "Open SQL File…", self.open_sql_file, "Ctrl+O")
         act(f, "Save SQL", lambda: self._save_current(False), QKeySequence.StandardKey.Save, "save")
         act(f, "Save SQL As…", lambda: self._save_current(True), "Ctrl+Shift+S")
@@ -497,15 +547,24 @@ class MainWindow(QMainWindow):
 
         d = mb.addMenu("&Database")
         self.create_table_act = act(d, "Create Table…", self._create_table_here, None, "table")
-        self.erd_act = act(d, "Diagram (ERD)", self._erd_here, "Ctrl+D", "erd")
+        self.erd_act = act(d, "Diagram (ERD)", self._erd_here, "Ctrl+D", "erd", "diagram")
+        self.designer_act = act(d, "Schema Designer", self._designer_here, "Ctrl+Shift+D", "designer", "designer")
+        self.admin_act = act(d, "Admin Console", self._admin_here, "Ctrl+Shift+A", "security", "admin")
         act(d, "Refresh Sidebar", self._refresh_here, "Ctrl+Shift+R", "refresh")
         d.addSeparator()
         act(d, "Disconnect All", self.manager.close_all)
 
         v = mb.addMenu("&View")
-        self.beginner_act = act(v, "Beginner Mode", lambda on: HelpCenter.get().set_beginner(on), None, "beginner")
-        self.beginner_act.setCheckable(True)
-        self.beginner_act.setChecked(HelpCenter.get().beginner)
+        mode_menu = v.addMenu("Mode")
+        self.mode_group = QActionGroup(self)
+        self.mode_group.setExclusive(True)
+        self.learning_act = act(mode_menu, "Learning Mode: teaches you to be a database admin",
+                                lambda: HelpCenter.get().set_mode("learning"), "Ctrl+Alt+1", "lessons")
+        self.power_act = act(mode_menu, "Power User Mode: tools for database admins",
+                             lambda: HelpCenter.get().set_mode("power"), "Ctrl+Alt+2", "ph.lightning")
+        for a in (self.learning_act, self.power_act):
+            a.setCheckable(True)
+            self.mode_group.addAction(a)
         v.addSeparator()
         act(v, "Connections", lambda: self._activity("connections") if not (self.side_panel.isVisible() and self.side_stack.currentIndex() == 0) else None, "Ctrl+1")
         act(v, "Toggle Sidebar", lambda: self.set_sidebar(not self.side_panel.isVisible()), "Ctrl+B", "sidebar")
@@ -520,13 +579,15 @@ class MainWindow(QMainWindow):
         act(v, "Actual Size", lambda: tm.zoom(None), "Ctrl+0")
 
         t = mb.addMenu("&Tools")
-        self.history_act = act(t, "Query History…", self.show_history, "Ctrl+Y", "history")
-        self.pw_tool_act = act(t, "Password && Encryption Tool…", lambda: self.password_tool(None), None, "key")
-        self.security_act = act(t, "Security Settings…", self.security_settings, None, "security")
+        self.history_act = act(t, "Query History…", self.show_history, "Ctrl+Y", "history", "history")
+        self.pw_tool_act = act(t, "Password && Encryption Tool…", lambda: self.password_tool(None), None, "key", "password_tool")
+        self.security_act = act(t, "Security Settings…", self.security_settings, None, "security", "security")
 
         h = mb.addMenu("&Help")
         self.lessons_act = act(h, "Lessons", self.show_lessons, "F1", "lessons")
-        act(h, "Concepts", lambda: (self.show_help(), HelpCenter.get().show_html("Help", HelpPanel.intro())), None, "book")
+        self.concepts_act = act(h, "Help Home", lambda: (self.show_help(), HelpCenter.get().show_html("Help", HelpPanel.intro(), teaching=False)), None, "book")
+        self.whats_this_act = act(h, "Explain Anything…", self.whats_this, "Shift+F1", "help")
+        self.whats_this_act.setToolTip("Click this, then click any button, field or panel to learn what it does")
         act(h, "About DB IDE", lambda: QMessageBox.about(self, "DB IDE", f"DB IDE {__version__}\nA local IDE for SQLite and MySQL/MariaDB."))
 
         tb = QToolBar("Main")
@@ -534,20 +595,44 @@ class MainWindow(QMainWindow):
         tb.setMovable(False)
         tb.setIconSize(QSize(18, 18))
         tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        for a in (self.new_conn_act, self.new_query_act, self.create_table_act, self.erd_act, self.history_act):
+        for a in (self.playground_act, self.template_act, self.new_conn_act, self.new_query_act, self.designer_act, self.erd_act,
+                  self.admin_act, self.history_act):
             tb.addAction(a)
+        # short toolbar labels (menus keep the full names)
+        self.admin_act.setIconText("Admin")
+        for a, short in ((self.playground_act, "Playground"), (self.template_act, "Templates"), (self.new_conn_act, "Connect"),
+                         (self.new_query_act, "Query"), (self.designer_act, "Designer"), (self.erd_act, "Diagram"),
+                         (self.history_act, "History")):
+            a.setIconText(short)
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         tb.addWidget(spacer)
         tb.addAction(self.lessons_act)
-        tb.addAction(self.beginner_act)
+        self.mode_button = QToolButton()
+        self.mode_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.mode_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.mode_button.setMenu(mode_menu)
+        self.mode_button.setToolTip("Switch between Learning mode and Power user mode")
+        tag(self.mode_button, "cmd:mode")
+        self.mode_button_action = tb.addWidget(self.mode_button)
+        tb.addAction(self.whats_this_act)
+        self.whats_this_act.setIconText("Explain")
+        # progressive disclosure: hide locked toolbar buttons, lock-mark their menu items
+        for a, feature in ((self.designer_act, "designer"), (self.erd_act, "diagram"), (self.history_act, "history"), (self.admin_act, "admin")):
+            gate.bind_tool(tb, a, feature)
+        for a, feature in ((self.designer_act, "designer"), (self.erd_act, "diagram"), (self.history_act, "history"), (self.admin_act, "admin"),
+                           (self.pw_tool_act, "password_tool"), (self.security_act, "security")):
+            gate.bind_menu(a, feature)
         self.main_toolbar = tb
         self.addToolBar(tb)
         for a, key in ((self.new_conn_act, "cmd:new_connection"), (self.new_query_act, "cmd:new_query"),
                        (self.create_table_act, "cmd:create_table"), (self.erd_act, "cmd:diagram"),
+                       (self.designer_act, "cmd:designer"),
                        (self.history_act, "cmd:history"), (self.lessons_act, "cmd:lessons"),
-                       (self.beginner_act, "cmd:beginner"), (self.pw_tool_act, "cmd:password_tool"),
-                       (self.security_act, "cmd:security")):
+                       (self.learning_act, "cmd:mode"), (self.power_act, "cmd:mode"), (self.pw_tool_act, "cmd:password_tool"),
+                       (self.admin_act, "cmd:admin"),
+                       (self.security_act, "cmd:security"), (self.playground_act, "cmd:playground"),
+                       (self.template_act, "cmd:templates"), (self.whats_this_act, "cmd:whats_this")):
             tag(a, key)
         tm.on_change(self.mode_act, lambda th: self.mode_act.setIcon(tm.icon("sun" if th.dark else "moon")))
         self.mode_act.setIcon(tm.icon("sun" if tm.theme.dark else "moon"))
@@ -566,46 +651,274 @@ class MainWindow(QMainWindow):
         elif isinstance(w, TableBuilderTab) and not save_as:
             w.apply()
 
+    def _target_conn(self) -> tuple[str | None, str | None]:
+        """The connection a toolbar tool should act on: the current tab's or sidebar selection,
+        or, if nothing is selected, the only open connection (ignoring the playground)."""
+        conn, schema = self._context_conn()
+        if conn and self.manager.is_open(conn):
+            return conn, schema
+        open_ = [cid for cid, _s in self.manager.open_sessions() if not P.is_playground(cid)]
+        if len(open_) == 1:
+            return open_[0], None
+        return conn, schema
+
     def _context_conn(self) -> tuple[str | None, str | None]:
         w = self.tabs.currentWidget()
-        if isinstance(w, (QueryTab, DataTab, TableBuilderTab, ErdTab)) and w.conn_id:
+        if hasattr(w, "conn_id") and getattr(w, "conn_id", None):
             return w.conn_id, w.schema
         return self.tree.current_context()
 
     def _create_table_here(self) -> None:
-        conn, schema = self._context_conn()
+        conn, schema = self._target_conn()
         if not conn or not self.manager.is_open(conn):
             QMessageBox.information(self, "Create Table", "Connect to a database first, then select it in the sidebar.")
             return
         s = self.manager.session(conn)
         if s.driver.supports_databases and not schema:
-            schema = s.cfg.database or None
-            if not schema:
+            schema = s.driver.default_schema(s.cfg)
+            if not schema and s.driver.schema_required:
                 QMessageBox.information(self, "Create Table", "Select a database in the sidebar first.")
                 return
         self.design_table(conn, schema, None)
 
+    def _designer_here(self) -> None:
+        conn, schema = self._target_conn()
+        if not conn or not self.manager.is_open(conn):
+            QMessageBox.information(self, "Schema Designer", "Connect to a database and select it in the sidebar first.")
+            return
+        s = self.manager.session(conn)
+        if s.driver.supports_databases and not schema:
+            schema = s.driver.default_schema(s.cfg)
+            if not schema and s.driver.schema_required:
+                QMessageBox.information(self, "Schema Designer", "Select a database in the sidebar first.")
+                return
+        self.open_designer(conn, schema)
+
+    def open_designer(self, conn_id: str, schema: str | None) -> None:
+        from dbide.ui.schema_designer import DesignerTab
+
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
+            if isinstance(w, DesignerTab) and (w.conn_id, w.schema) == (conn_id, schema):
+                self.tabs.setCurrentIndex(i)
+                return
+        tab = DesignerTab(self.manager, conn_id, schema)
+        tab.open_table.connect(lambda t: self.open_data(conn_id, schema, t))
+        tab.advanced_requested.connect(lambda t: self.design_table(conn_id, schema, t))
+        tab.applied.connect(lambda cid, sch: self.tree.refresh(cid, sch))
+        self._add_tab(tab)
+
     def _erd_here(self) -> None:
-        conn, schema = self._context_conn()
+        conn, schema = self._target_conn()
         if not conn or not self.manager.is_open(conn):
             QMessageBox.information(self, "Diagram", "Connect to a database and select it in the sidebar first.")
             return
         s = self.manager.session(conn)
         if s.driver.supports_databases and not schema:
-            schema = s.cfg.database or None
-            if not schema:
+            schema = s.driver.default_schema(s.cfg)
+            if not schema and s.driver.schema_required:
                 QMessageBox.information(self, "Diagram", "Select a database in the sidebar first.")
                 return
         self.open_erd(conn, schema)
 
     # ---- teaching / security ------------------------------------------------
-    def _beginner_changed(self, on: bool) -> None:
-        self.beginner_act.setChecked(on)
-        self.beginner_badge.setVisible(on)
-        if on:
+    def _mode_changed(self, m: str) -> None:
+        self._apply_mode()
+        learning = m == "learning"
+        if learning:
             self.show_help()
-        self.statusBar().showMessage("Beginner mode on: explanations and safety checks enabled." if on
-                                     else "Beginner mode off.", 5000)
+        self.statusBar().showMessage(
+            "Learning mode: lessons, explanations and safety prompts are on." if learning
+            else "Power user mode: every tool is available; help covers the software only.", 6000)
+
+    def _apply_mode(self, initial: bool = False) -> None:
+        """Show what belongs to the current mode: lessons/progress/teaching in Learning, the full toolset in Power."""
+        learning = HelpCenter.get().beginner
+        self.learning_act.setChecked(learning)
+        self.power_act.setChecked(not learning)
+        self.mode_button.setText("Learning mode" if learning else "Power user")
+        self.mode_button.setIcon(ThemeManager.get().icon("lessons" if learning else "ph.lightning", "accent"))
+        self.mode_badge.setText("Learning mode" if learning else "Power user mode")
+        self.mode_badge.setToolTip("Click to switch modes (also View → Mode)")
+        # lessons, progress and the playground are learning tools; power users get a cleaner workspace
+        self.lessons_act.setVisible(learning)
+        self.playground_act.setVisible(learning)
+        for key in ("lessons", "progress", "playground"):
+            self.activity_buttons[key].setVisible(learning)
+        if not learning and self.side_stack.currentIndex() in (1, 2):
+            self.side_stack.setCurrentIndex(0)
+            self._sync_activity()
+        for card in getattr(self, "_learning_cards", []):
+            if shiboken6.isValid(card):
+                card.setVisible(learning)
+        for card in getattr(self, "_power_cards", []):
+            if shiboken6.isValid(card):
+                card.setVisible(not learning)
+        if not initial:
+            self._want_help = learning
+            self._apply_responsive()
+            HelpCenter.get().show_html("Help", HelpPanel.intro(), teaching=False)
+        Gate.get().refresh()
+
+    def _first_run(self) -> None:
+        dlg = ModeChooser(self)
+        dlg.exec()
+        HelpCenter.get().set_mode(dlg.choice)
+        self._apply_mode()
+        if dlg.choice == "learning":
+            # straight into a safe playground, with the lessons alongside
+            self.open_playground("store")
+            self.show_lessons()
+
+    def _admin_here(self) -> None:
+        conn, schema = self._target_conn()
+        if not conn or not self.manager.is_open(conn):
+            QMessageBox.information(self, "Admin Console", "Connect to a database and select it in the sidebar first.")
+            return
+        s = self.manager.session(conn)
+        if s.driver.supports_databases and not schema:
+            schema = s.driver.default_schema(s.cfg)
+        self.open_admin(conn, schema)
+
+    def open_admin(self, conn_id: str, schema: str | None) -> None:
+        from dbide.ui.admin_tab import AdminTab
+
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
+            if isinstance(w, AdminTab) and (w.conn_id, w.schema) == (conn_id, schema):
+                self.tabs.setCurrentIndex(i)
+                return
+        self._add_tab(AdminTab(self.manager, conn_id, schema))
+
+    # ---- playground, templates, progress ----------------------------------------
+    def open_playground(self, key: str | None = None) -> None:
+        from dbide.ui.playground_tab import PlaygroundTab
+
+        key = key if key in TEMPLATES else (settings().get("playground_last") or "store")
+        settings().set("playground_last", key)
+        progress().record("template")
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
+            if isinstance(w, PlaygroundTab):
+                if w.key == key:
+                    self.tabs.setCurrentIndex(i)
+                    return
+                # one playground at a time: switching dataset replaces the tab
+                w.shutdown()
+                self.tabs.removeTab(i)
+                w.deleteLater()
+                break
+        tab = PlaygroundTab(self, key)
+        self._add_tab(tab)
+        self._start_playground_session(key)
+
+    def _start_playground_session(self, key: str) -> None:
+        pg = P.playground()
+        cfg = pg.config(key)
+        if self.manager.is_open(cfg.id):
+            return
+
+        def open_it(_=None):
+            self.manager.open(cfg, None)
+
+        if pg.exists(key):
+            open_it()
+        else:
+            run_async(lambda: pg.create(key), open_it, lambda m: QMessageBox.critical(self, "Playground", m))
+
+    def reset_playground(self, key: str) -> None:
+        cid = P.conn_id(key)
+        self.manager.close(cid)
+        pg = P.playground()
+        run_async(lambda: pg.create(key), lambda _p: self.manager.open(pg.config(key), None),
+                  lambda m: QMessageBox.critical(self, "Reset", m))
+
+    def when_connected(self, conn_id: str, fn) -> None:
+        """Run fn() once conn_id is connected (now, if it already is)."""
+        if self.manager.is_open(conn_id):
+            fn()
+            return
+        self._conn_waiters.setdefault(conn_id, []).append(fn)
+
+    def _run_conn_waiters(self, conn_id: str) -> None:
+        for fn in self._conn_waiters.pop(conn_id, []):
+            fn()
+
+    def templates_dialog(self, preselect: str | None = None) -> None:
+        from dbide.ui.templates_dialog import TemplateGallery
+
+        dlg = TemplateGallery(self.manager, self, preselect)
+        if not dlg.exec() or not dlg.choice:
+            return
+        if dlg.choice[0] == "playground":
+            self.open_playground(dlg.choice[1])
+        else:
+            self.create_from_template(dlg.choice[1], dlg.choice[2])
+
+    def create_from_template(self, key: str, opts: dict) -> None:
+        tpl = TEMPLATES[key]
+
+        def build(conn_id, schema):
+            s = self.manager.session(conn_id)
+
+            def done(counts):
+                progress().record("template", "create_table", "relationship")
+                self.tree.refresh(conn_id, schema)
+                self.statusBar().showMessage(f"Created {tpl.name}: " + ", ".join(f"{t} ({n} rows)" for t, n in counts.items()), 10000)
+                self.open_erd(conn_id, schema)
+                ideas = "\n".join(f"--   {t.text}" for t in tpl.try_this if not t.sql)
+                self.new_query(conn_id, schema, f"-- {tpl.name} is ready. Ask in plain English above, e.g.:\n{ideas}\n")
+
+            run_async(lambda: apply_template(s, tpl, schema, opts.get("sample", True)), done,
+                      lambda m: QMessageBox.critical(self, "Create project", m))
+
+        if opts["target"] == "file":
+            from pathlib import Path
+
+            path = Path(opts["path"]).expanduser()
+            if path.exists():
+                QMessageBox.warning(self, "Create project", f"{path} already exists. Choose a new file name.")
+                return
+            path.parent.mkdir(parents=True, exist_ok=True)
+            cfg = ConnectionConfig(name=tpl.name if not any(c.name == tpl.name for c in self.manager.store.all()) else path.stem,
+                                   driver="sqlite", database=str(path))
+            self.manager.store.upsert(cfg)
+            self.tree.reload_profiles()
+            self.when_connected(cfg.id, lambda: build(cfg.id, None))
+            self.manager.open(cfg, None)
+        else:
+            build(opts["conn_id"], opts.get("schema"))
+
+    def add_sqlite_project(self, path, name: str, copy_roles_from: str | None = None) -> None:
+        cfg = ConnectionConfig(name=f"{name} (from Playground)", driver="sqlite", database=str(path))
+        self.manager.store.upsert(cfg)
+        if copy_roles_from:
+            data = role_store().data.get(copy_roles_from, {})
+            role_store().data[cfg.id] = {k: dict(v) for k, v in data.items()}
+            role_store()._save()
+        self.tree.reload_profiles()
+        self.manager.open(cfg, None)
+        self.statusBar().showMessage(f"Saved to {path} and added to your connections.", 8000)
+
+    def whats_this(self) -> None:
+        from PySide6.QtWidgets import QWhatsThis
+
+        QWhatsThis.enterWhatsThisMode()
+        self.statusBar().showMessage("Click anything to learn what it is. Press Esc to cancel.", 6000)
+
+    def show_progress(self) -> None:
+        self.side_stack.setCurrentIndex(2)
+        self.set_sidebar(True)
+
+    def _level_up(self, level: int) -> None:
+        if hasattr(self, "_toast") and self._toast is not None and shiboken6.isValid(self._toast):
+            self._toast.close()
+        self._toast = LevelToast(self, level, self.show_progress)
+        from dbide.core.progress import FEATURES, LEVELS
+
+        feats = "".join(f"<li><b>{f.title}</b>: {f.why}</li>" for f in FEATURES.values() if f.level == level)
+        HelpCenter.get().show_html(f"New level: {LEVELS[level][1]}", f"<p>You've learned enough to use more tools:</p><ul>{feats}</ul>"
+                                   "<p>See everything in <b>Your Progress</b> (trophy icon).</p>", hold=10)
 
     def show_lessons(self) -> None:
         self.side_stack.setCurrentIndex(1)
@@ -621,6 +934,7 @@ class MainWindow(QMainWindow):
         tab = ErdTab(self.manager, conn_id, schema)
         tab.open_table.connect(lambda t: self.open_data(conn_id, schema, t))
         tab.join_requested.connect(lambda sql: self.new_query(conn_id, schema, sql))
+        tab.designer_requested.connect(lambda: self.open_designer(conn_id, schema))
         self._add_tab(tab)
 
     def visualize_join(self, conn_id: str, sql: str) -> None:
@@ -935,3 +1249,45 @@ class MainWindow(QMainWindow):
                 w.shutdown()
         self.manager.close_all()
         e.accept()
+
+
+class ModeChooser(QDialog):
+    """First launch: how do you want to use DB IDE?"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Welcome to DB IDE")
+        self.setMinimumWidth(640)
+        self.choice = "learning"
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(24, 20, 24, 20)
+        lay.setSpacing(14)
+        hero = QLabel("How would you like to use DB IDE?")
+        hero.setObjectName("Hero")
+        f = hero.font()
+        f.setPointSizeF(f.pointSizeF() * 1.5)
+        hero.setFont(f)
+        lay.addWidget(hero)
+        sub = QLabel("You can switch any time from <b>View → Mode</b> or the mode button in the toolbar.")
+        sub.setObjectName("Muted")
+        lay.addWidget(sub)
+        row = QHBoxLayout()
+        row.setSpacing(14)
+        self.cards = []
+        row.addWidget(Card("lessons", "Learning mode",
+                           "Learn to be a database admin: a safe playground, ten lessons from your first table to indexes, "
+                           "transactions, backups and permissions, explanations everywhere, and tools that unlock as you grow.",
+                           lambda: self._pick("learning")))
+        row.addWidget(Card("ph.lightning", "Power user mode",
+                           "For database admins: every tool from the start (Admin Console, designers, query plans), "
+                           "no prompts, help about the software only.", lambda: self._pick("power")))
+        lay.addLayout(row)
+        for i in range(row.count()):
+            card = row.itemAt(i).widget()
+            card.setMinimumHeight(190)  # room for the wrapped description
+            card.setMinimumWidth(280)
+        self.setMinimumHeight(330)
+
+    def _pick(self, m: str) -> None:
+        self.choice = m
+        self.accept()

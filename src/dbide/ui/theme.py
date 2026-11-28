@@ -346,6 +346,11 @@ ICON_ALIASES = {
     "book": ["ph.book-open"],
     "info": ["ph.info"],
     "more": ["ph.dots-three-outline"],
+    "designer": ["ph.pencil-simple-line", "ph.pencil-simple", "ph.pencil", "mdi6.pencil-outline"],
+    "chart": ["ph.chart-bar"],
+    "sliders": ["ph.sliders-horizontal"],
+    "caret_down": ["ph.caret-down", "mdi6.chevron-down"],
+    "caret_up": ["ph.caret-up", "mdi6.chevron-up"],
 }
 
 _icon_cache: dict[tuple[str, str], QIcon] = {}
@@ -418,6 +423,9 @@ def build_stylesheet(t: Theme, tm: ThemeManager) -> str:
     pad = tm.pad
     r = 7  # corner radius
     sel = t.selection
+    arrow = _icon_file("caret_down", t.muted)
+    arrow_hover = _icon_file("caret_down", t.text)
+    arrow_up = _icon_file("caret_up", t.muted)
     close_icon = _icon_file("discard", t.muted)
     close_hover = _icon_file("discard", t.text)
     return f"""
@@ -468,7 +476,16 @@ QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QFontComboBox {{
     selection-background-color: {t.accent}; selection-color: {t.accent_text}; }}
 QLineEdit:focus, QSpinBox:focus, QComboBox:focus {{ border: 1px solid {t.accent}; }}
 QLineEdit:hover, QComboBox:hover, QSpinBox:hover {{ border-color: {t.mix(t.border, t.text, 0.25)}; }}
-QComboBox::drop-down {{ border: none; width: 22px; }}
+QComboBox::drop-down {{ subcontrol-origin: padding; subcontrol-position: top right; border: none; width: 24px; }}
+QComboBox::down-arrow {{ image: url({arrow}); width: 12px; height: 12px; }}
+QComboBox::down-arrow:hover, QComboBox::down-arrow:on {{ image: url({arrow_hover}); }}
+QComboBox {{ padding-right: 26px; }}
+QSpinBox::up-button, QDoubleSpinBox::up-button {{ subcontrol-origin: border; subcontrol-position: top right; width: 18px; border: none; }}
+QSpinBox::down-button, QDoubleSpinBox::down-button {{ subcontrol-origin: border; subcontrol-position: bottom right; width: 18px; border: none; }}
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {{ image: url({arrow_up}); width: 10px; height: 10px; }}
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {{ image: url({arrow}); width: 10px; height: 10px; }}
+QSpinBox, QDoubleSpinBox {{ padding-right: 20px; }}
+QTableView QComboBox, QTableWidget QComboBox {{ border-radius: 0; padding: 0 22px 0 6px; border: 1px solid {t.accent}; }}
 QComboBox QAbstractItemView {{ background: {t.raised}; border: 1px solid {t.border}; selection-background-color: {sel};
     selection-color: {t.text}; outline: none; padding: 4px; }}
 QPushButton {{ background: {t.raised}; border: 1px solid {t.border}; border-radius: {r}px; padding: {pad(6)}px {pad(14)}px; }}

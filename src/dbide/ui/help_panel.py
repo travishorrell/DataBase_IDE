@@ -17,7 +17,8 @@ class HelpCenter(QObject):
     """App-wide hub. Anything can call show_topic()/show_html(); the panel listens."""
 
     changed = Signal(str, str)  # title, html
-    beginner_changed = Signal(bool)
+    beginner_changed = Signal(bool)  # True = learning mode (kept for older callers)
+    mode_changed = Signal(str)  # "learning" | "power"
 
     _instance: "HelpCenter | None" = None
 
@@ -29,25 +30,46 @@ class HelpCenter(QObject):
 
     def __init__(self):
         super().__init__()
-        self._beginner = bool(settings().get("beginner_mode"))
         self._last_key = None
         self._hold_until = 0.0
 
+    # ---- mode -------------------------------------------------------------------
+    @property
+    def mode(self) -> str:
+        from dbide.core import mode
+
+        return mode.current()
+
     @property
     def beginner(self) -> bool:
-        return self._beginner
+        """True in Learning mode: explanations, prompts and lessons are on."""
+        return self.mode == "learning"
+
+    def set_mode(self, m: str) -> None:
+        from dbide.core import mode
+
+        if m != mode.current():
+            mode.set_mode(m)
+            self._last_key = None
+            self.mode_changed.emit(m)
+            self.beginner_changed.emit(m == "learning")
 
     def set_beginner(self, on: bool) -> None:
-        if on != self._beginner:
-            self._beginner = on
-            settings().set("beginner_mode", on)
-            self.beginner_changed.emit(on)
+        self.set_mode("learning" if on else "power")
+
+    # ---- showing help -------------------------------------------------------------
+    @staticmethod
+    def is_software_topic(key: str) -> bool:
+        """Power user mode keeps help about the IDE itself (cmd:*), not SQL or database teaching."""
+        return key.startswith("cmd:")
 
     def show_topic(self, key: str | None, passive: bool = False) -> None:
         """passive=True (cursor-following) doesn't replace an explanation the user just asked for."""
         import time
 
         if not key or key == self._last_key:
+            return
+        if not self.beginner and not self.is_software_topic(key):
             return
         if passive and time.monotonic() < self._hold_until:
             return
@@ -56,16 +78,23 @@ class HelpCenter(QObject):
             self._last_key = key
             self.changed.emit(t[0], t[1])
 
-    def show_html(self, title: str, body: str, hold: float = 4.0) -> None:
+    def show_html(self, title: str, body: str, hold: float = 4.0, teaching: bool = True) -> None:
+        """teaching=True content (SQL and database explanations) only appears in Learning mode."""
         import time
 
+        if teaching and not self.beginner:
+            return
         self._last_key = None
         self._hold_until = time.monotonic() + hold
         self.changed.emit(title, body)
 
 
 def tag(obj, key: str) -> None:
-    """Attach a help topic to a widget or QAction."""
+    """Attach a help topic to a widget or QAction (hover help, status tip and 'Explain anything')."""
+    t = knowledge.topic(key)
+    if t:
+        obj.setWhatsThis(f"<b>{t[0]}</b><br>{t[1]}")
+        obj.setProperty("dbide_help_key", key)
     if isinstance(obj, QAction):
         obj.hovered.connect(lambda: HelpCenter.get().show_topic(key))
         t = knowledge.topic(key)
@@ -85,6 +114,15 @@ class HoverFilter(QObject):
     """Shows a widget's help topic when the mouse enters it (or any child of it)."""
 
     def eventFilter(self, obj, ev):
+        if ev.type() == QEvent.Type.WhatsThis and not HelpCenter.get().beginner:
+            key = obj.property("dbide_help_key") if hasattr(obj, "property") else None
+            if key and not HelpCenter.is_software_topic(key):
+                from PySide6.QtWidgets import QWhatsThis
+
+                t = knowledge.topic(key)
+                QWhatsThis.showText(ev.globalPos(), f"<b>{t[0] if t else ''}</b><br><i>Concept explanations are in Learning mode "
+                                    "(View → Mode).</i>", obj)
+                return True
         if ev.type() == QEvent.Type.Enter and isinstance(obj, QWidget):
             w = obj
             for _ in range(4):
@@ -125,6 +163,9 @@ class HelpPanel(QWidget):
         self._timer = QTimer(self, singleShot=True, interval=120)  # avoid flicker while moving the mouse
         self._timer.timeout.connect(self._flush)
         self._show("Welcome", self.intro())
+        from dbide.ui.worker import connect_owned
+
+        connect_owned(HelpCenter.get().mode_changed, self, lambda _m: self._show("Help", self.intro()))
 
     def _style(self, t) -> None:
         self.view.document().setDefaultStyleSheet(
@@ -140,6 +181,30 @@ class HelpPanel(QWidget):
 
     @staticmethod
     def intro() -> str:
+        if not HelpCenter.get().beginner:
+            return HelpPanel.power_intro()
+        return HelpPanel.learning_intro()
+
+    @staticmethod
+    def power_intro() -> str:
+        rows = [("⌘T", "New query"), ("⌘↩ / ⌘⇧↩", "Run statement / run all"), ("⌘.", "Stop query"), ("⌘E", "Query plan"),
+                ("⌘J", "Visualize JOIN"), ("⌃Space", "Autocomplete"), ("⌘/", "Toggle comment"), ("⌘D", "Diagram"),
+                ("⌘⇧D", "Schema Designer"), ("⌘⇧A", "Admin Console"), ("⌘Y", "Query history"), ("⌘S", "Apply grid edits / save SQL"),
+                ("⌘B", "Toggle sidebar"), ("⌘⇧L", "Light / dark"), ("⌘+ / ⌘−", "Zoom"), ("⇧F1", "Explain any control")]
+        table = "".join(f"<tr><td><code>{html.escape(k)}</code></td><td>{html.escape(v)}</td></tr>" for k, v in rows)
+        return (
+            "<p><b>Power user mode</b>: every tool is available, there are no prompts, and this panel only covers the software.</p>"
+            f"<p><b>Shortcuts</b></p><table cellpadding='3'>{table}</table>"
+            "<p><b>Tools</b></p><ul>"
+            "<li><b>Admin Console</b>: overview, integrity check, Analyze, Vacuum/Optimize, backups, running queries, users, settings</li>"
+            "<li><b>Schema Designer</b> and <b>Table Designer</b>: visual DDL with a reviewed SQL plan</li>"
+            "<li><b>Ask bar</b>: offline English → SELECT, editable</li>"
+            "<li><b>Import/Export</b>: CSV, JSON, SQL; <b>History</b>; <b>Diagram</b>; <b>Charts</b></li></ul>"
+            "<p>Want explanations and lessons? Switch to <b>Learning mode</b> (View → Mode).</p>"
+        )
+
+    @staticmethod
+    def learning_intro() -> str:
         concepts = "".join(
             f'<li><a href="topic:{k}">{html.escape(v[0])}</a></li>' for k, v in knowledge.CONCEPTS.items()
         )
@@ -169,7 +234,7 @@ class HelpPanel(QWidget):
     def _link(self, url) -> None:
         s = url.toString()
         if s == "home":
-            HelpCenter.get().show_html("Help", self.intro())
+            HelpCenter.get().show_html("Help", self.intro(), teaching=False)
         elif s.startswith("topic:"):
             HelpCenter.get()._last_key = None
             HelpCenter.get().show_topic(s[6:])

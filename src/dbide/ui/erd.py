@@ -419,6 +419,7 @@ class ErdView(QGraphicsView):
 class ErdTab(QWidget):
     open_table = Signal(str)
     join_requested = Signal(str)
+    designer_requested = Signal()
 
     def __init__(self, manager, conn_id: str, schema: str | None):
         super().__init__()
@@ -456,6 +457,11 @@ class ErdTab(QWidget):
         self.media_act.setChecked(True)
         self.media_act.setToolTip("Show where image/video columns keep their files")
         act("Export…", self.export, icon="export")
+        tb.addSeparator()
+        from dbide.ui.features import Gate
+
+        edit = act("Edit in Designer", Gate.get().guarded("designer", lambda: self.designer_requested.emit(), self), icon="designer")
+        tag(edit, "cmd:designer")
         tb.setObjectName("TabToolbar")
         tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         responsive_toolbar(tb, self, 760)
@@ -600,8 +606,12 @@ class ErdTab(QWidget):
         r = self.scene.itemsBoundingRect().adjusted(-40, -40, 40, 40)
         self.scene.setSceneRect(r)
         self.view.fitInView(r, Qt.AspectRatioMode.KeepAspectRatio)
-        if self.view.transform().m11() > 1.2:
+        z = self.view.transform().m11()
+        if z > 1.2 or z < 0.6:  # keep labels readable; very large diagrams scroll instead
             self.view.resetTransform()
+            if z < 0.6:
+                self.view.scale(0.6, 0.6)
+            self.view.centerOn(r.center())
 
     def export(self) -> None:
         path, flt = QFileDialog.getSaveFileName(self, "Export diagram", "diagram.png", "PNG image (*.png);;SVG (*.svg)")
@@ -635,11 +645,12 @@ class ErdTab(QWidget):
         if c == p:
             p = p + "2"
         on = " AND ".join(f"{c}.{drv.quote(cc)} = {p}.{drv.quote(pc)}" for cc, pc in zip(rel.child_cols, rel.parent_cols))
+        body = (f"SELECT {c}.*, {p}.*\nFROM {drv.qualify(rel.child, self.schema)} AS {c}\n"
+                f"JOIN {drv.qualify(rel.parent, self.schema)} AS {p} ON {on}")
         return (
             f"-- Each {rel.child} row points to one {rel.parent} row via {', '.join(rel.child_cols)}.\n"
             f"-- INNER JOIN keeps only matching pairs; change to LEFT JOIN to keep every {rel.child} row.\n"
-            f"SELECT {c}.*, {p}.*\nFROM {drv.qualify(rel.child, self.schema)} AS {c}\n"
-            f"JOIN {drv.qualify(rel.parent, self.schema)} AS {p} ON {on}\nLIMIT 100;\n"
+            + drv.select_limit(body, 100) + ";\n"
         )
 
     def explain_relation(self, rel: ErdRelation) -> None:
@@ -699,4 +710,4 @@ class ErdTab(QWidget):
                      "<p>Double-click the box to open the folder.</p>")
         HelpCenter.get().show_html("Where is this media stored?", where + (
             "<p><i>This was guessed from the column name/type. Set a role in Design Table to confirm.</i></p>" if info.guessed else "")
-            + "<p><a href='topic:concept:media'>BLOB vs file path: which should I use?</a></p>")
+            + "<p><a href='topic:concept:media'>BLOB vs file path: which should I use?</a></p>", teaching=False)

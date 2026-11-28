@@ -119,7 +119,7 @@ class LessonPanel(QWidget):
         st = self.step
         self.progress.setText(f"Step {self.step_index + 1} / {len(steps)}")
         self.body.setHtml(f"<h3>{html.escape(st.title)}</h3>{st.body}")
-        self.sql.setPlainText(st.sql)
+        self.sql.setPlainText(L.render_sql(st.sql))
         self.sql.setVisible(bool(st.sql))
         self.paste_btn.setVisible(bool(st.sql))
         self.do_btn.setVisible(bool(st.sql or st.roles or st.sample_media))
@@ -135,13 +135,13 @@ class LessonPanel(QWidget):
         self.main.ensure_practice(lambda: fn(self.main.manager.session(L.PRACTICE_ID)))
 
     def put_in_editor(self) -> None:
-        self._with_practice(lambda s: self.main.new_query(L.PRACTICE_ID, None, self.step.sql + "\n"))
+        self._with_practice(lambda s: self.main.new_query(L.PRACTICE_ID, None, L.render_sql(self.step.sql) + "\n"))
 
     def do_it(self) -> None:
         st = self.step
 
         def go(session):
-            sql = st.sql
+            sql = L.render_sql(st.sql)
             name = session.cfg.name
 
             def work():
@@ -209,6 +209,8 @@ class LessonPanel(QWidget):
                 m.visualize_join(L.PRACTICE_ID, self.step.sql)
             elif act == "password_tool":
                 m.password_tool(L.PRACTICE_ID)
+            elif act == "open_admin":
+                m.open_admin(L.PRACTICE_ID, None)
 
         self._with_practice(go)
 
@@ -227,6 +229,10 @@ class LessonPanel(QWidget):
 
     def _checked(self, result) -> None:
         ok, msg = result
+        if ok:
+            from dbide.core.progress import progress
+
+            progress().record("lesson")
         self.result.setText(msg + ("<br><b>Click Next ▶ to continue.</b>" if ok else ""))
         self.next_btn.setDefault(ok)
 

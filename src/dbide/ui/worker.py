@@ -63,3 +63,26 @@ def _call(fn, arg) -> None:
         # The widget that asked for this result was closed while it was loading.
         if "already deleted" not in str(exc):
             raise
+
+
+def connect_owned(signal, owner, fn) -> None:
+    """Connect fn to a long-lived signal only for as long as `owner` (a QObject) exists.
+
+    Plain connections to lambdas or to widgets that get closed keep firing after the
+    widget is gone; this skips the call and disconnects when the owner is destroyed.
+    """
+    import shiboken6
+
+    def slot(*args):
+        if shiboken6.isValid(owner):
+            fn(*args)
+
+    signal.connect(slot)
+
+    def drop(*_):
+        try:
+            signal.disconnect(slot)
+        except (RuntimeError, TypeError):
+            pass
+
+    owner.destroyed.connect(drop)

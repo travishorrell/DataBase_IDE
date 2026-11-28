@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import sqlite3
 from pathlib import Path
 
 from sqlalchemy import Connection, event
@@ -32,12 +33,22 @@ class SQLiteDriver(Driver):
     def engine_kwargs(self, cfg: ConnectionConfig) -> dict:
         return {"connect_args": {"check_same_thread": False, "timeout": 10}}
 
-    def install_hooks(self, engine) -> None:
+    def install_hooks(self, engine, cfg=None) -> None:
+        sandbox = bool(cfg is not None and cfg.options.get("sandbox"))
+
         @event.listens_for(engine, "connect")
         def _pragmas(dbapi_conn, _record):
             cur = dbapi_conn.cursor()
             cur.execute("PRAGMA foreign_keys = ON")
             cur.close()
+            if sandbox:
+                # the playground may only touch its own file: no ATTACH/DETACH of other databases
+                deny = {getattr(sqlite3, "SQLITE_ATTACH", 24), getattr(sqlite3, "SQLITE_DETACH", 25)}
+
+                def authorizer(action, *_args):
+                    return sqlite3.SQLITE_DENY if action in deny else sqlite3.SQLITE_OK
+
+                dbapi_conn.set_authorizer(authorizer)
 
     def connection_id(self, conn: Connection):
         return conn.connection.dbapi_connection

@@ -184,7 +184,7 @@ def test_lessons_walkthrough(tmp_path):
     for lsn in lessons.LESSONS:
         for step in lsn.steps:
             if step.sql:
-                for r in q.run(step.sql):
+                for r in q.run(lessons.render_sql(step.sql)):
                     recent.insert(0, (r.sql, r.error is None))
             for key, code in step.roles.items():
                 t, c = key.split(".")

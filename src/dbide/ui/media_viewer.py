@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSlider,
     QVBoxLayout,
+    QWidget,
 )
 
 from dbide.core import media
@@ -165,7 +166,7 @@ class InsertMediaDialog(QDialog):
     def __init__(self, cfg: ConnectionConfig, column: str, role: ColumnRole | None, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Insert media into {column}")
-        self.setMinimumWidth(560)
+        self.setMinimumWidth(600)
         self.cfg, self.role = cfg, role
         self.value = None
         self.new_role: ColumnRole | None = None
@@ -179,7 +180,7 @@ class InsertMediaDialog(QDialog):
         row.addWidget(browse)
 
         self.blob = QRadioButton("Store the file INSIDE the database (BLOB)")
-        self.pathopt = QRadioButton(f"Copy the file into the media folder and store its PATH\n   ({media.default_folder(cfg)})")
+        self.pathopt = QRadioButton("Copy the file into a media folder and store its PATH in the row")
         grp = QButtonGroup(self)
         grp.addButton(self.blob)
         grp.addButton(self.pathopt)
@@ -206,12 +207,74 @@ class InsertMediaDialog(QDialog):
             lay.addWidget(self.pathopt)
             lay.addWidget(explain)
             lay.addWidget(self.remember)
+        # where path-stored files go: visible, changeable, openable
+        self.default_folder = str(media.default_folder(cfg))
+        self.folder = (role.folder if role and role.folder else "") or self.default_folder
+        self.folder_label = QLabel()
+        self.folder_label.setWordWrap(True)
+        self.folder_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        change = QPushButton("Change…")
+        change.clicked.connect(self._choose_folder)
+        opener = QPushButton("Open Folder")
+        opener.clicked.connect(lambda: (Path(self.folder).mkdir(parents=True, exist_ok=True),
+                                        QDesktopServices.openUrl(QUrl.fromLocalFile(self.folder))))
+        fbox = QVBoxLayout()
+        fbox.setContentsMargins(0, 4, 0, 0)
+        fbox.addWidget(self.folder_label)
+        brow = QHBoxLayout()
+        brow.addStretch()
+        brow.addWidget(change)
+        brow.addWidget(opener)
+        fbox.addLayout(brow)
+        self.folder_box = QWidget()
+        self.folder_box.setLayout(fbox)
+        lay.addWidget(self.folder_box)
+        self.pathopt.toggled.connect(self._sync_folder)
+        self.blob.toggled.connect(self._sync_folder)
+        self._sync_folder()
         self.size_label = QLabel("")
         lay.addWidget(self.size_label)
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         bb.accepted.connect(self._accept)
         bb.rejected.connect(self.reject)
         lay.addWidget(bb)
+
+    def _sync_folder(self, *_):
+        on_disk = self.pathopt.isChecked()
+        self.folder_box.setVisible(on_disk)
+        where = "default: next to the database" if self.folder == self.default_folder else "custom folder"
+        fm = self.folder_label.fontMetrics()
+        shown = fm.elidedText(self.folder, Qt.TextElideMode.ElideMiddle, 520)
+        self.folder_label.setTextFormat(Qt.TextFormat.RichText)
+        self.folder_label.setText(f"<b>Files are saved to</b> ({where}):<br><code>{html.escape(shown)}</code>")
+        self.folder_label.setToolTip(self.folder)
+        self._fit_height()
+
+    def _fit_height(self) -> None:
+        """Grow to fit wrapped text at the current width (Qt doesn't do this for dialogs by itself)."""
+        lay = self.layout()
+        if lay is None:
+            return
+        h = lay.totalHeightForWidth(max(self.width(), self.minimumWidth()))
+        if h > 0:
+            self.setMinimumHeight(h)
+            if self.height() < h:
+                self.resize(self.width(), h)
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self._fit_height()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if e.oldSize().width() != e.size().width():
+            self._fit_height()
+
+    def _choose_folder(self):
+        d = QFileDialog.getExistingDirectory(self, "Choose the media folder", self.folder)
+        if d:
+            self.folder = d
+            self._sync_folder()
 
     def _browse(self):
         p, _ = QFileDialog.getOpenFileName(self, "Choose image or video", "",
@@ -231,12 +294,16 @@ class InsertMediaDialog(QDialog):
             QMessageBox.information(self, "Insert media", "Choose a file first.")
             return
         blob = self.blob.isChecked()
+        custom = "" if self.folder == self.default_folder else self.folder
         try:
-            self.value = media.read_bytes(src) if blob else media.store_file(src, self.cfg, self.role.folder if self.role else "")
+            self.value = media.read_bytes(src) if blob else media.store_file(src, self.cfg, custom)
         except OSError as exc:
             QMessageBox.critical(self, "Insert media", str(exc))
             return
         if not (self.role and self.role.kind == "media") and self.remember.isChecked():
             self.new_role = ColumnRole("media", storage="blob" if blob else "path", media_kind=media.kind_from_name(src)
-                                       if media.kind_from_name(src) != "file" else "any")
+                                       if media.kind_from_name(src) != "file" else "any", folder=custom if not blob else "")
+        elif self.role and self.role.kind == "media" and not blob and (self.role.folder or "") != custom:
+            # remember the new folder for this column
+            self.new_role = ColumnRole("media", storage=self.role.storage, media_kind=self.role.media_kind, folder=custom)
         self.accept()

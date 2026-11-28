@@ -159,6 +159,28 @@ class SqlEditor(QPlainTextEdit):
         self.completer.setModel(QStringListModel([], self.completer))
         self.completer.activated.connect(self._insert_completion)
 
+    def event(self, e):
+        from PySide6.QtCore import QEvent
+
+        from dbide.ui.help_panel import HelpCenter
+
+        if e.type() == QEvent.Type.ToolTip and HelpCenter.get().beginner:
+            from PySide6.QtWidgets import QToolTip
+
+            from dbide.core import knowledge
+
+            cur = self.cursorForPosition(e.pos())
+            cur.select(QTextCursor.SelectionType.WordUnderCursor)
+            word = cur.selectedText()
+            key = knowledge.keyword_topic(word) if word else None
+            tip = knowledge.short_tip(key) if key else None
+            if tip:
+                QToolTip.showText(e.globalPos(), tip, self)
+            else:
+                QToolTip.hideText()
+            return True
+        return super().event(e)
+
     def _theme_changed(self, _theme) -> None:
         self.setFont(monospace_font())
         self.setTabStopDistance(self.fontMetrics().horizontalAdvance(" ") * 4)

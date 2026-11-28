@@ -39,7 +39,10 @@ class Driver:
     supports_databases = False  # server holds multiple databases shown in the tree
     ddl_transactional = False  # DDL can be rolled back as a unit
     ddl_cleanup: list[str] = []
-    explain_prefix = "EXPLAIN "  # statements that restore session settings after a failed DDL batch
+    explain_prefix: str | None = "EXPLAIN "  # None = no query-plan support from the editor
+    container_label = "Database"  # what the tree's second level is called (database or schema)
+    named_unique_constraints = False  # UNIQUE constraints are dropped with DROP CONSTRAINT (Postgres / SQL Server)
+    length_fn = "LENGTH"  # byte length of a BLOB value
     system_schemas: set[str] = set()
     common_types: list[str] = []
     extra_keywords: list[str] = []
@@ -51,7 +54,7 @@ class Driver:
     def engine_kwargs(self, cfg: ConnectionConfig) -> dict[str, Any]:
         return {}
 
-    def install_hooks(self, engine) -> None:
+    def install_hooks(self, engine, cfg=None) -> None:
         """Attach SQLAlchemy event listeners (pragmas etc.)."""
 
     def connection_id(self, conn: Connection) -> Any:
@@ -73,6 +76,33 @@ class Driver:
     def literal(self, value: str) -> str:
         return "'" + value.replace("'", "''") + "'"
 
+    # ---- dialect differences used across the app -------------------------------
+    def select_limit(self, select_sql: str, limit: int, offset: int = 0, order_sql: str = "") -> str:
+        """`select_sql` + ORDER BY + row limit, in this dialect (LIMIT/OFFSET by default)."""
+        sql = select_sql.rstrip().rstrip(";") + (f"\n{order_sql}" if order_sql else "") + f"\nLIMIT {int(limit)}"
+        return sql + (f" OFFSET {int(offset)}" if offset else "")
+
+    schema_required = False  # MySQL: tools need a database chosen; Postgres/SQL Server fall back to public/dbo
+    tree_default_schema: str | None = None  # schema to expand automatically in the sidebar
+
+    def default_schema(self, cfg) -> str | None:
+        """Schema to use when none is selected (None = the server's default, e.g. public / dbo)."""
+        return None
+
+    def use_schema_sql(self, schema: str) -> str | None:
+        """Make `schema` the default for unqualified names in this session (None if unsupported)."""
+        return None
+
+    def insert_default_row_sql(self, qualified_table: str) -> str:
+        return f"INSERT INTO {qualified_table} DEFAULT VALUES"
+
+    def before_explicit_ids(self, table_sql: str) -> list[str]:
+        """Statements needed before inserting explicit values into an auto-numbered column."""
+        return []
+
+    def after_explicit_ids(self, table: str, schema: str | None, column: str) -> list[str]:
+        """Statements to run after inserting explicit ids (e.g. move a sequence past them)."""
+        return []
     # ---- introspection ----------------------------------------------------
     def list_databases(self, insp: Inspector) -> list[str]:
         return []
@@ -114,6 +144,8 @@ class Driver:
         for ix in insp.get_indexes(table, schema=schema):
             if not ix.get("name") or any(col is None for col in ix["column_names"]):
                 continue  # expression indexes are not editable here
+            if ix.get("duplicates_constraint"):
+                continue  # the index behind a UNIQUE constraint; listed below as the constraint
             seen.add(ix["name"])
             indexes.append(
                 IndexDef(ix["name"], list(ix["column_names"]), bool(ix.get("unique")), ix["name"])
@@ -122,7 +154,7 @@ class Driver:
             name = uc.get("name")
             uc_cols = list(uc["column_names"])
             if name and name not in seen:
-                indexes.append(IndexDef(name, uc_cols, True, name))
+                indexes.append(IndexDef(name, uc_cols, True, name, constraint=self.named_unique_constraints))
             elif not name:
                 # e.g. SQLite `email TEXT UNIQUE`: show it so a rebuild keeps it
                 gen = f"uq_{table}_{'_'.join(uc_cols)}"
@@ -205,3 +237,120 @@ class Driver:
 
     def functions(self) -> list[str]:
         return SQL_FUNCTIONS
+
+
+class GenericAlterMixin:
+    """ALTER TABLE planning shared by drivers with one-change-per-statement DDL (Postgres, SQL Server).
+
+    Subclasses provide the small per-dialect statement builders (_rename_table, _alter_type …).
+    Order: drop links and indexes, drop the old PK, drop/rename/add/change columns,
+    add the new PK, indexes and links, then rename the table.
+    """
+
+    def alter_table_sql(self, old: TableDef, new: TableDef) -> list[str]:
+        from dbide.core.schema_model import normalize_type
+
+        t = self.qualify(old.name, old.schema)
+        out: list[str] = []
+        old_cols = {c.name: c for c in old.columns}
+        new_by_orig = {c.original_name: c for c in new.columns if c.original_name in old_cols}
+
+        def orig(name: str) -> str:
+            for c in new.columns:
+                if c.name == name:
+                    return c.original_name or name
+            return name
+
+        # 1. foreign keys and indexes that change or go away
+        old_fk = {f.original_name: f for f in old.foreign_keys if f.original_name}
+        keep_fk = set()
+        for fk in new.foreign_keys:
+            o = old_fk.get(fk.original_name) if fk.original_name else None
+            if o and fk.name == o.name and [orig(c) for c in fk.columns] == o.columns and (
+                    fk.ref_table, fk.ref_columns, fk.on_delete, fk.on_update) == (o.ref_table, o.ref_columns, o.on_delete, o.on_update):
+                keep_fk.add(o.original_name)
+        for name in old_fk:
+            if name not in keep_fk:
+                out.append(f"ALTER TABLE {t} DROP CONSTRAINT {self.quote(name)}")
+        old_ix = {i.original_name: i for i in old.indexes if i.original_name}
+        keep_ix = set()
+        for ix in new.indexes:
+            o = old_ix.get(ix.original_name) if ix.original_name else None
+            if o and ix.name == o.name and [orig(c) for c in ix.columns] == o.columns and ix.unique == o.unique:
+                keep_ix.add(o.original_name)
+        for name, ix in old_ix.items():
+            if name not in keep_ix:
+                out.append(f"ALTER TABLE {t} DROP CONSTRAINT {self.quote(name)}" if ix.constraint else self._drop_index(name, old))
+        new_pk = [orig(c) for c in new.primary_key]
+        pk_changed = new_pk != old.primary_key
+        if pk_changed and old.primary_key:
+            out.append(self._drop_pk(old))
+
+        # 2. columns
+        for name in old_cols:
+            if name not in new_by_orig:
+                out.append(f"ALTER TABLE {t} DROP COLUMN {self.quote(name)}")
+        for c in new.columns:
+            o = old_cols.get(c.original_name) if c.original_name else None
+            if o is None:
+                out.append(self._add_column(t, c, new))
+                continue
+            if c.name != o.name:
+                out += self._rename_column(old, o.name, c.name)
+            ref = self.quote(c.name)
+            if normalize_type(c.type) != normalize_type(o.type):
+                out += self._alter_type(t, ref, c)
+            if c.auto_increment != o.auto_increment:
+                out += self._alter_identity(t, ref, c)
+            nullable = c.nullable and not c.primary_key
+            if nullable != (o.nullable and not o.primary_key):
+                out += self._alter_null(t, ref, c, nullable)
+            if (c.default or None) != (o.default or None):
+                out += self._alter_default(t, old, c, o)
+
+        # 3. new primary key, indexes, links
+        if pk_changed and new.primary_key:
+            cols = ", ".join(self.quote(c) for c in new.primary_key)
+            out.append(f"ALTER TABLE {t} ADD CONSTRAINT {self.quote('pk_' + new.name)} PRIMARY KEY ({cols})")
+        for ix in new.indexes:
+            if ix.original_name in keep_ix:
+                continue
+            cols = ", ".join(self.quote(c) for c in ix.columns)
+            if ix.constraint:  # a UNIQUE constraint (as opposed to a unique index)
+                out.append(f"ALTER TABLE {t} ADD CONSTRAINT {self.quote(ix.name)} UNIQUE ({cols})")
+            else:
+                out.append(self.create_index_sql(ix, old))
+        for fk in new.foreign_keys:
+            if fk.original_name not in keep_fk:
+                out.append(f"ALTER TABLE {t} ADD {self.fk_sql(fk, new.schema)}")
+        if new.name != old.name:
+            out += self._rename_table(old, new.name)
+        return out
+
+    # per-dialect pieces
+    def _add_column(self, t, c, td):
+        raise NotImplementedError
+
+    def _rename_column(self, td, old, new):
+        raise NotImplementedError
+
+    def _rename_table(self, td, new):
+        raise NotImplementedError
+
+    def _alter_type(self, t, ref, c):
+        raise NotImplementedError
+
+    def _alter_null(self, t, ref, c, nullable):
+        raise NotImplementedError
+
+    def _alter_default(self, t, td, c, o):
+        raise NotImplementedError
+
+    def _alter_identity(self, t, ref, c):
+        raise NotImplementedError
+
+    def _drop_pk(self, td):
+        raise NotImplementedError
+
+    def _drop_index(self, name, td):
+        raise NotImplementedError

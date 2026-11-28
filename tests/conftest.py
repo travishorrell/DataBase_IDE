@@ -9,8 +9,16 @@ def isolated_app(tmp_path, monkeypatch):
 
     settings.reset_settings_for_tests()
     settings.settings().set("beginner_mode", False)
+    settings.settings().set("mode", "learning")  # mode tests switch to power explicitly
+    settings.settings().set("first_run_done", True)  # the first-launch test turns this off itself
     secrets.set_store(secrets.SessionStore())
     roles.set_role_store(None)
+    from dbide.core import playground, progress
+
+    playground.reset_for_tests()
+    progress.reset_for_tests()
+    # existing tests exercise every feature: start them at the expert level (progress tests reset this)
+    settings.settings().set("progress", {"skills": {}, "override": 3})
     try:
         from dbide.ui.help_panel import HelpCenter
 

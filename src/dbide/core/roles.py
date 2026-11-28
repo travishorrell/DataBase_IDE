@@ -37,6 +37,12 @@ class ColumnRole:
             return f"🖼 {what} in database (BLOB)" if self.storage == "blob" else f"📁 {what} file path"
         return ""
 
+    def short(self) -> str:
+        """Compact tag for diagrams: 'password', 'encrypted', 'image · db', 'video · file'."""
+        if self.kind == "media":
+            return f"{self.media_kind if self.media_kind != 'any' else 'file'} · {'db' if self.storage == 'blob' else 'file'}"
+        return self.kind
+
     def code(self) -> str:
         """Stable string used in the designer's combo box."""
         if self.kind == "media":
@@ -69,14 +75,56 @@ def role_choices() -> list[tuple[str, str]]:
     return out
 
 
-def suggested_type(role: ColumnRole, driver_key: str) -> str:
-    if role.kind == "media" and role.storage == "blob":
-        return "LONGBLOB" if driver_key == "mysql" else "BLOB"
-    if role.kind == "media":
-        return "VARCHAR(1024)" if driver_key == "mysql" else "TEXT"
+# "Special" data types offered in every Type dropdown. Each is a real SQL type plus a role.
+SMART_TYPES: list[tuple[str, str]] = [
+    ("🔑 Password (hashed)", "password:argon2id"),
+    ("🔒 Encrypted text", "encrypted:aes256gcm"),
+    ("🖼 Image (stored in database)", "media:blob:image"),
+    ("📁 Image (file on disk)", "media:path:image"),
+    ("🎬 Video (file on disk)", "media:path:video"),
+    ("🎬 Video (stored in database)", "media:blob:video"),
+    ("📎 File (stored in database)", "media:blob:any"),
+    ("📁 File (file on disk)", "media:path:any"),
+]
+SMART_BY_LABEL = {label: code for label, code in SMART_TYPES}
+SMART_BY_CODE = {code: label for label, code in SMART_TYPES}
+
+
+def smart_label(role: "ColumnRole | None") -> str | None:
+    """The dropdown label for a role, if it is one of the special types."""
+    if role is None:
+        return None
+    code = role.code()
+    if code in SMART_BY_CODE:
+        return SMART_BY_CODE[code]
     if role.kind == "password":
-        return "VARCHAR(255)" if driver_key == "mysql" else "TEXT"
-    return "TEXT"
+        return SMART_TYPES[0][0]
+    if role.kind == "encrypted":
+        return SMART_TYPES[1][0]
+    return None
+
+
+def from_smart(label: str) -> "ColumnRole | None":
+    code = SMART_BY_LABEL.get(label.strip())
+    return ColumnRole.from_code(code) if code else None
+
+
+def type_choices(common: list[str]) -> list[str]:
+    """SQL types, then the special types (a '' entry marks the separator)."""
+    return list(common) + [""] + [label for label, _ in SMART_TYPES]
+
+
+def suggested_type(role: ColumnRole, driver_key: str) -> str:
+    blob = {"mysql": "LONGBLOB", "postgresql": "BYTEA", "mssql": "VARBINARY(MAX)"}.get(driver_key, "BLOB")
+    long_text = {"mysql": "VARCHAR(1024)", "mssql": "NVARCHAR(1024)"}.get(driver_key, "TEXT")
+    short_text = {"mysql": "VARCHAR(255)", "mssql": "NVARCHAR(255)"}.get(driver_key, "TEXT")
+    if role.kind == "media" and role.storage == "blob":
+        return blob
+    if role.kind == "media":
+        return long_text
+    if role.kind == "password":
+        return short_text
+    return {"mssql": "NVARCHAR(MAX)"}.get(driver_key, "TEXT")
 
 
 _MEDIA_NAME = re.compile(r"(image|img|photo|picture|avatar|thumb|logo|video|movie|clip|media|file|attachment|cover)", re.I)

@@ -8,6 +8,9 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QComboBox,
+    QHBoxLayout,
+    QLineEdit,
+    QPushButton,
     QFileDialog,
     QLabel,
     QMessageBox,
@@ -29,7 +32,7 @@ from dbide.ui.theme import ThemeManager, responsive_toolbar
 from dbide.ui.connections import ConnectionManager
 from dbide.ui.grid import GridView, ResultModel
 from dbide.ui.sql_editor import SqlEditor, monospace_font
-from dbide.ui.worker import run_async
+from dbide.ui.worker import connect_owned, run_async
 
 EXPORT_FILTER = "CSV (*.csv);;JSON (*.json);;SQL INSERT statements (*.sql)"
 
@@ -79,7 +82,8 @@ class QueryTab(QWidget):
         self.db_combo.currentIndexChanged.connect(self._db_chosen)
         tb.addWidget(QLabel(" Connection "))
         tb.addWidget(self.conn_combo)
-        self.db_label = tb.addWidget(QLabel("  Database "))
+        self._db_label_widget = QLabel("  Database ")
+        self.db_label = tb.addWidget(self._db_label_widget)
         self.db_action = tb.addWidget(self.db_combo)
         tb.addSeparator()
 
@@ -117,6 +121,16 @@ class QueryTab(QWidget):
         if run_btn is not None:
             run_btn.setObjectName("Primary")
         responsive_toolbar(tb, self, 860)
+        from dbide.ui.features import Gate
+
+        gate = Gate.get()
+        for a, feature in ((self.explain_act, "query_plan"), (self.join_act, "join_viz"), (self.run_all_act, "run_all")):
+            gate.bind_tool(tb, a, feature)
+        self.explain_act.triggered.disconnect()
+        self.explain_act.triggered.connect(gate.guarded("query_plan", self.explain, self))
+        self.join_act.triggered.disconnect()
+        self.join_act.triggered.connect(gate.guarded("join_viz", self.visualize_join, self))
+        self._gate_toolbar = tb
         for a, key in ((self.run_act, "cmd:run"), (self.run_all_act, "cmd:run_all"), (self.cancel_act, "cmd:stop"),
                        (self.explain_act, "cmd:explain"), (self.english_act, "cmd:explain_english"),
                        (self.join_act, "cmd:visualize_join")):
@@ -124,13 +138,17 @@ class QueryTab(QWidget):
         tag(self.conn_combo, "cmd:connection")
         tag(self.db_combo, "cmd:database")
         tb.addSeparator()
-        tb.addWidget(QLabel(" Max rows "))
+        self._max_rows_label_action = tb.addWidget(QLabel(" Max rows "))
         self.max_rows = QSpinBox()
         self.max_rows.setRange(1, 1_000_000)
         self.max_rows.setValue(5000)
         self.max_rows.setSingleStep(1000)
-        tb.addWidget(self.max_rows)
+        max_rows_action = tb.addWidget(self.max_rows)
         tag(self.max_rows, "cmd:max_rows")
+        from dbide.ui.features import Gate as _G
+
+        _G.get().bind_action(max_rows_action, "run_all")
+        _G.get().bind_action(self._max_rows_label_action, "run_all")
 
         self.results = QTabWidget()
         self.results.setObjectName("Results")
@@ -162,12 +180,13 @@ class QueryTab(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
         lay.addWidget(tb)
+        lay.addWidget(self._build_ask_bar())
         lay.addWidget(split)
         self._fit_split(has_rows=False)
 
         follow_editor(self.editor)
-        manager.connected.connect(lambda _: self.refresh_connections())
-        manager.disconnected.connect(self._on_disconnected)
+        connect_owned(manager.connected, self, lambda _: self.refresh_connections())
+        connect_owned(manager.disconnected, self, self._on_disconnected)
         self.refresh_connections(prefer=conn_id)
         self.editor.setFocus()
 
@@ -240,11 +259,12 @@ class QueryTab(QWidget):
         self.db_combo.blockSignals(True)
         self.db_combo.clear()
         self.db_label.setVisible(drv.supports_databases)
+        self._db_label_widget.setText(f"  {drv.container_label} ")
         self.db_action.setVisible(drv.supports_databases)
         self.db_combo.blockSignals(False)
         self._applied_schema = None
         if drv.supports_databases:
-            want = self.schema or session.cfg.database or None
+            want = self.schema or session.driver.default_schema(session.cfg) or session.driver.tree_default_schema
 
             def fill(names, want=want, cid=cid):
                 if cid != self.conn_id:
@@ -266,6 +286,8 @@ class QueryTab(QWidget):
 
     def _db_chosen(self, idx: int) -> None:
         self.schema = self.db_combo.itemData(idx) if idx >= 0 else None
+        if hasattr(self, "_nl_cache"):
+            self._nl_cache.clear()
         self._load_catalog()
 
     def _load_catalog(self) -> None:
@@ -274,8 +296,8 @@ class QueryTab(QWidget):
             return
         schema, cid = self.schema, self.conn_id
         if session.driver.supports_databases and not schema:
-            schema = session.cfg.database or None
-            if not schema:
+            schema = session.driver.default_schema(session.cfg)
+            if not schema and session.driver.schema_required:
                 self.editor.set_catalog({})
                 return
 
@@ -312,6 +334,11 @@ class QueryTab(QWidget):
         sql = self._selected_sql(False).strip()
         session = self.manager.session(self.conn_id) if self.conn_id else None
         if sql and session:
+            if session.driver.explain_prefix is None:
+                self._log(f"Query plans for {session.driver.label} aren't available from the editor "
+                          "(SQL Server needs SET SHOWPLAN_TEXT ON in a separate batch).")
+                self.results.setCurrentWidget(self.messages)
+                return
             self.run(sql_override=session.driver.explain_prefix + sql)
 
     def explain_english(self) -> None:
@@ -338,6 +365,14 @@ class QueryTab(QWidget):
         dlg = JoinVisualizer(session, sql, self)
         dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dlg.show()
+
+    def _beginner_explain_only(self, sql: str, session) -> None:
+        """Playground: explain what will happen, but don't ask. Undo makes it safe."""
+        exs = [explain_sql(st.text, session.cfg.driver) for st in split_sql(sql, session.driver.hash_comments)[:5]]
+        exs = [e for e in exs if e is not None]
+        if exs:
+            HelpCenter.get().show_html("What you just ran", "".join(_explanation_html(e) for e in exs)
+                                       + ("<p>This is the playground, so even this can be undone.</p>" if any(e.destructive for e in exs) else ""))
 
     def _beginner_check(self, sql: str, session) -> bool:
         """In beginner mode, explain each statement and confirm anything destructive."""
@@ -371,12 +406,16 @@ class QueryTab(QWidget):
         if not sql.strip():
             return
         session = self.manager.session(self.conn_id)
-        if HelpCenter.get().beginner and not sql_override and not self._beginner_check(sql, session):
+        sandbox = bool(session.cfg.options.get("sandbox"))
+        from_ask, self._run_from_ask = getattr(self, "_run_from_ask", False), False
+        if HelpCenter.get().beginner and not sql_override and not sandbox and not self._beginner_check(sql, session):
             return
+        if sandbox and HelpCenter.get().beginner and not sql_override:
+            self._beginner_explain_only(sql, session)
         qconn, max_rows = self.qconn, self.max_rows.value()
         use_sql = None
         if session.driver.supports_databases and self.schema and self.schema != self._applied_schema:
-            use_sql = f"USE {session.driver.quote(self.schema)}"
+            use_sql = session.driver.use_schema_sql(self.schema)  # USE / SET search_path / None
         self.running = True
         self._update_enabled()
         self.status.setText("Running…")
@@ -395,10 +434,21 @@ class QueryTab(QWidget):
             self.running = False
             self._update_enabled()
             self._show_results(results)
+            from dbide.core.progress import progress
+            from dbide.core.session import is_read_only
+
             for r in results:
                 self.manager.history.add(conn_name, r.sql, r.error is None, r.elapsed, max(r.rowcount, 0))
+                if from_ask:  # the IDE wrote this SQL: it shows you asked, not that you wrote a JOIN yourself
+                    if r.error is None:
+                        progress().record("first_query")
+                else:
+                    progress().record_sql(r.sql, r.error is None)
+            if HelpCenter.get().beginner and session.cfg.options.get("sandbox") and any(not is_read_only(r.sql) and not r.error for r in results):
+                self._log("↶ Changed something you didn't mean to? Click Undo in the playground banner.")
             if any(_is_ddl(r.sql) and not r.error for r in results):
                 self.schema_maybe_changed.emit(self.conn_id)
+                self._nl_cache.clear()
                 self._load_catalog()
 
         def failed(msg):
@@ -431,7 +481,7 @@ class QueryTab(QWidget):
             short = " ".join(r.sql.split())
             short = short[:160] + ("…" if len(short) > 160 else "")
             if r.error:
-                hint = friendly_error(r.error)
+                hint = friendly_error(r.error) if HelpCenter.get().beginner else None  # power users get the raw error
                 self._log(f"✗ {short}\n  {r.error}\n" + (f"  💡 {_strip(hint)}\n" if hint else ""))
                 if hint:
                     HelpCenter.get().show_html("What went wrong?", f"<p><code>{html.escape(r.error)}</code></p><p>{hint}</p>")
@@ -454,6 +504,17 @@ class QueryTab(QWidget):
             else:
                 affected = f"{r.rowcount} row(s) affected" if r.rowcount >= 0 else "OK"
                 self._log(f"✓ {short}\n  {affected} in {r.elapsed * 1000:.1f} ms\n")
+        chart_for = next((r for r in results if r.returns_rows and not r.error and r.rows), None)
+        self.chart_panel = None
+        if chart_for is not None:
+            from dbide.ui.chart_view import ChartPanel
+
+            panel = ChartPanel(chart_for.columns, list(chart_for.rows), advanced=not HelpCenter.get().beginner)
+            idx = self.results.addTab(panel, "Chart")
+            self.results.setTabIcon(idx, ThemeManager.get().icon("chart", "muted"))
+            tag(panel, "cmd:chart")
+            self.chart_panel = panel
+        prefer_chart, self._prefer_chart = self._prefer_chart, False
         errors = [r for r in results if r.error]
         if errors:
             self.results.setCurrentWidget(self.messages)
@@ -461,8 +522,10 @@ class QueryTab(QWidget):
         else:
             if first_grid:
                 self.results.setCurrentWidget(first_grid)
-                self._fit_split(True, first_grid.model().rowCount())
+                self._fit_split(True, max(first_grid.model().rowCount(), 12 if self.chart_panel and self.chart_panel.has_chart else 0))
                 first_grid.fit_columns()
+                if prefer_chart and self.chart_panel is not None and self.chart_panel.has_chart:
+                    self.results.setCurrentWidget(self.chart_panel)  # instant visual feedback for asked questions
             else:
                 self.results.setCurrentWidget(self.messages)
             if HelpCenter.get().beginner and any(" JOIN " in f" {r.sql.upper()} " for r in results if r.returns_rows):
@@ -472,6 +535,132 @@ class QueryTab(QWidget):
                 f"{len(results)} statement(s) · {rows} row(s) · {total_time * 1000:.1f} ms"
                 if results else "No statements to run"
             )
+
+    # ---- plain English → SQL ----------------------------------------------------
+    def _build_ask_bar(self) -> QWidget:
+        box = QWidget()
+        box.setObjectName("AskBar")
+        v = QVBoxLayout(box)
+        v.setContentsMargins(10, 8, 10, 6)
+        v.setSpacing(4)
+        row = QHBoxLayout()
+        self.ask = QLineEdit()
+        self.ask.setPlaceholderText("Ask in plain English, e.g. “customers in UK with more than 2 orders” or “total sales per product”")
+        self.ask.setClearButtonEnabled(True)
+        tm = ThemeManager.get()
+        self.ask.addAction(tm.icon("english", "accent"), QLineEdit.ActionPosition.LeadingPosition)
+        self.ask.returnPressed.connect(self.generate_sql)
+        self.ask_btn = QPushButton("Write SQL")
+        self.ask_btn.setObjectName("Primary")
+        self.ask_btn.setToolTip("Translate your request into SQL (offline), put it in the editor and run it")
+        self.ask_btn.clicked.connect(self.generate_sql)
+        tag(self.ask, "cmd:ask")
+        tag(self.ask_btn, "cmd:ask")
+        row.addWidget(self.ask, 1)
+        row.addWidget(self.ask_btn)
+        v.addLayout(row)
+        self.ask_info = QLabel("")
+        self.ask_info.setTextFormat(Qt.TextFormat.RichText)
+        self.ask_info.setWordWrap(True)
+        self.ask_info.setVisible(False)
+        self.ask_info.setContentsMargins(4, 0, 4, 0)
+        v.addWidget(self.ask_info)
+        self._nl_cache: dict = {}
+        self.chart_panel = None
+        self._last_generated = ""
+        self._prefer_chart = False
+        return box
+
+    def _nl_schema(self, session, then) -> None:
+        from dbide.core.nl2sql import load_schema
+        from dbide.core.roles import role_store
+
+        key = (self.conn_id, self.schema)
+        if key in self._nl_cache:
+            then(self._nl_cache[key])
+            return
+        protected = {t: {c for c, r in cols.items() if r.kind in ("password", "encrypted", "media")}
+                     for t, cols in role_store().all_tables(self.conn_id, self.schema).items()}
+        schema = self.schema
+
+        def done(info):
+            self._nl_cache[key] = info
+            then(info)
+
+        run_async(lambda: load_schema(session, schema, protected), done,
+                  lambda m: self._ask_message(f"Couldn't read the schema: {html.escape(m)}", error=True))
+
+    def _ask_message(self, text: str, error: bool = False) -> None:
+        t = ThemeManager.get().theme
+        self.ask_info.setText(f"<span style='color:{t.danger if error else t.muted}'>{text}</span>")
+        self.ask_info.setVisible(True)
+
+    def generate_sql(self) -> None:
+        text = self.ask.text().strip()
+        session = self.manager.session(self.conn_id) if self.conn_id else None
+        if not text:
+            return
+        if not session:
+            self._ask_message("Connect to a database first.", error=True)
+            return
+        from dbide.core.nl2sql import NotUnderstood, translate
+
+        self._ask_message("Reading your request…")
+
+        def go(info):
+            try:
+                g = translate(info, text, session.driver.quote, session.driver.qualify, self.schema, session.driver.select_limit)
+            except NotUnderstood as exc:
+                self._ask_message(html.escape(str(exc)), error=True)
+                HelpCenter.get().show_html("Plain English → SQL", f"<p>{html.escape(str(exc))}</p>" + _ASK_TIPS, teaching=False)
+                return
+            self._show_interpretation(text, g)
+            from dbide.core.progress import progress
+
+            progress().record("ask")
+            self._insert_generated(g.sql)
+            self._prefer_chart = True
+            self._run_from_ask = True
+            self.run(sql_override=g.sql)
+
+        self._nl_schema(session, go)
+
+    def _show_interpretation(self, text: str, g) -> None:
+        t = ThemeManager.get().theme
+        chips = " ".join(
+            f"<span style='background-color:{t.accent_soft}; color:{t.text}'>&nbsp;{html.escape(st.phrase)}&nbsp;</span>"
+            f"<span style='color:{t.muted}'> → {st.meaning}</span>&nbsp;&nbsp;"
+            for st in g.steps if st.phrase != "(grouping)"
+        )
+        extra = ""
+        if g.ignored:
+            extra += f"<br><span style='color:{t.warning}'>⚠ I didn't use: {html.escape(', '.join(g.ignored))}. Check the SQL.</span>"
+        for w in g.warnings:
+            extra += f"<br><span style='color:{t.warning}'>⚠ {html.escape(w)}</span>"
+        self.ask_info.setText(chips + extra)
+        self.ask_info.setVisible(True)
+        rows = "".join(f"<li><b>{html.escape(st.phrase)}</b> → {st.meaning}</li>" for st in g.steps)
+        HelpCenter.get().show_html(
+            "How I read your request",
+            f"<p>“{html.escape(text)}”</p><ul>{rows}</ul>"
+            + (f"<p>⚠ Words I didn't use: {html.escape(', '.join(g.ignored))}</p>" if g.ignored else "")
+            + "<p>The SQL is in the editor. It's yours to read, edit and re-run with ⌘↩. "
+              "Generated queries only ever read data (SELECT).</p>" + _ASK_TIPS, hold=8, teaching=False)
+
+    def _insert_generated(self, sql: str) -> None:
+        ed = self.editor
+        current = ed.toPlainText().strip()
+        if not current or current == self._last_generated.strip():
+            ed.setPlainText(sql)
+            cur = ed.textCursor()
+            cur.movePosition(cur.MoveOperation.End)
+            ed.setTextCursor(cur)
+        else:
+            cur = ed.textCursor()
+            cur.movePosition(cur.MoveOperation.End)
+            cur.insertText("\n\n" + sql)
+            ed.setTextCursor(cur)
+        self._last_generated = sql
 
     def _fit_split(self, has_rows: bool, rows: int = 0) -> None:
         """Give the results pane room that matches what came back, unless the user resized it."""
@@ -531,3 +720,14 @@ def _explanation_html(ex) -> str:
     for w in ex.warnings:
         out += f"<p style='color:#cb2431'>{w}</p>"
     return out
+
+
+_ASK_TIPS = (
+    "<p><b>Things you can ask</b></p><ul>"
+    "<li>customers in UK sorted by name</li><li>how many orders per status</li>"
+    "<li>total of orders per customer</li><li>top 5 most expensive products</li>"
+    "<li>orders in 2024 over 100</li><li>customers without orders</li>"
+    "<li>authors with more than 2 books</li><li>products whose title contains 'pro'</li></ul>"
+    "<p>It works offline using your table and column names and the values stored in your text columns.</p>"
+)
+

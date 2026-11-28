@@ -4,7 +4,11 @@ from __future__ import annotations
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -20,7 +24,7 @@ from dbide.core.knowledge import friendly_error
 from dbide.core.roles import prepare_row, role_store
 from dbide.core.transfer import export_rows
 from dbide.ui.connections import ConnectionManager
-from dbide.ui.grid import EditableTableModel, GridView
+from dbide.ui.grid import CheckHeader, EditableTableModel, GridView
 from dbide.ui.help_panel import HelpCenter, tag
 from dbide.ui.theme import ThemeManager, responsive_toolbar
 from dbide.ui.media_viewer import InsertMediaDialog, MediaViewer
@@ -42,8 +46,6 @@ class DataTab(QWidget):
         tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         responsive_toolbar(tb, self, 880)
         tm = ThemeManager.get()
-        icons = {"Refresh": "refresh", "Row+": "plus", "Row-": "minus", "Set NULL": "null", "Apply": "apply",
-                 "Discard": "discard", "Export…": "export", "prev": "prev", "next": "next"}
 
         def act(text, slot, shortcut=None, tip=None, help_key=None, icon=None):
             a = QAction(text, self)
@@ -67,10 +69,26 @@ class DataTab(QWidget):
         self.del_act = act("Delete Row", self.delete_rows, tip="Mark selected rows for deletion (click again to undo)", help_key="cmd:del_row", icon="trash")
         self.null_act = act("Set NULL", self.set_null, tip="Set selected cells to NULL", help_key="cmd:set_null", icon="null")
         tb.addSeparator()
+        # row checkboxes: pick many rows, then delete or update them together
+        self.check_all_box = QCheckBox("Select all")
+        self.check_all_box.setToolTip("Tick every row on this page (click a row's box in the left column to tick it alone)")
+        self.check_all_box.clicked.connect(lambda on: self.model.check_all(on))
+        tb.addWidget(self.check_all_box)
+        self.checked_label = QLabel("")
+        self.checked_label.setObjectName("Muted")
+        tb.addWidget(self.checked_label)
+        self.del_checked_act = act("Delete Checked", self.delete_checked, help_key="cmd:check_rows", icon="trash",
+                                   tip="Mark every checked row for deletion (saved when you Apply)")
+        self.upd_checked_act = act("Update Checked…", self.update_checked, help_key="cmd:check_rows", icon="designer",
+                                   tip="Set one column to the same value on every checked row (saved when you Apply)")
+        tb.addSeparator()
         self.apply_act = act("Apply", self.apply, "Ctrl+S", "Save staged changes to the database (⌘S)", "cmd:apply", icon="apply")
         self.discard_act = act("Discard", self.discard, help_key="cmd:discard", icon="discard")
         tb.addSeparator()
-        act("Export…", self.export, help_key="cmd:export", icon="export")
+        from dbide.ui.features import Gate
+
+        self.export_act = act("Export…", Gate.get().guarded("export", self.export, self), help_key="cmd:export", icon="export")
+        Gate.get().bind_tool(tb, self.export_act, "export")
         tb.addSeparator()
         self.prev_act = act("Previous", self.prev_page, tip="Previous page", icon="prev")
         self.page_label = QLabel(" ")
@@ -113,7 +131,9 @@ class DataTab(QWidget):
         self.model.rowsInserted.connect(lambda *_: self._update_actions())
         self.model.rowsRemoved.connect(lambda *_: self._update_actions())
         self.grid = GridView()
+        self.grid.setVerticalHeader(CheckHeader(self.grid))
         self.grid.setModel(self.model)
+        self.model.checks_changed.connect(self._checks_changed)
         null_ctx = QAction("Set NULL", self.grid)
         null_ctx.triggered.connect(self.set_null)
         del_ctx = QAction("Delete / Undelete Row", self.grid)
@@ -128,7 +148,13 @@ class DataTab(QWidget):
         self.reveal_ctx.triggered.connect(self.reveal)
         self.verify_ctx = QAction("Check a Password Against This Hash…", self.grid)
         self.verify_ctx.triggered.connect(self.verify_password)
-        self.grid.extra_actions = [null_ctx, del_ctx, None, self.media_ctx, self.view_ctx, self.reveal_ctx, self.verify_ctx]
+        self.folder_ctx = QAction("Open Media Folder", self.grid)
+        self.folder_ctx.triggered.connect(self.open_media_folder)
+        self.grid.extra_actions = [null_ctx, del_ctx, None, self.media_ctx, self.view_ctx, self.folder_ctx, None,
+                                   self.reveal_ctx, self.verify_ctx]
+        from dbide.core import media as _media
+
+        self.model.resolve_media = lambda v: _media.resolve(v, self.session.cfg)
         self.grid.doubleClicked.connect(self._double_clicked)
         self.grid.selectionModel().currentChanged.connect(lambda cur, _prev: self._explain_cell(cur))
 
@@ -179,6 +205,7 @@ class DataTab(QWidget):
             self.model.reset_page(page.columns, page.rows, [] if self.is_view else page.primary_key)
             self.model.set_roles(role_store().get(self.conn_id, self.schema, self.table))
             self.grid.fit_columns()
+            self._load_header_tips()
             end = offset + len(page.rows)
             self.page_label.setText(f"  {offset + 1 if page.rows else 0}–{end} of {page.total}  ")
             if self.is_view:
@@ -197,10 +224,65 @@ class DataTab(QWidget):
 
         run_async(lambda: s.fetch_page(self.table, self.schema, limit, offset, where, order), done, failed)
 
+    def _load_header_tips(self) -> None:
+        s, table, schema = self.session, self.table, self.schema
+        roles = role_store().get(self.conn_id, schema, table)
+
+        def work():
+            td = s.table_def(table, schema)
+            return td
+
+        def done(td):
+            import html as _h
+
+            fks = {fk.columns[0]: fk for fk in td.foreign_keys if len(fk.columns) == 1}
+            uniq = {ix.columns[0] for ix in td.indexes if ix.unique and len(ix.columns) == 1}
+            tips = {}
+            if not HelpCenter.get().beginner:
+                for c in td.columns:
+                    bits = [_h.escape(c.type)]
+                    if c.primary_key:
+                        bits.append("PK")
+                    if c.name in fks:
+                        bits.append(f"FK → {_h.escape(fks[c.name].ref_table)}.{_h.escape(fks[c.name].ref_columns[0])}")
+                    if not c.nullable and not c.primary_key:
+                        bits.append("NOT NULL")
+                    if c.name in uniq:
+                        bits.append("UNIQUE")
+                    if c.default:
+                        bits.append(f"DEFAULT {_h.escape(c.default)}")
+                    if c.name in roles:
+                        bits.append(_h.escape(roles[c.name].label()))
+                    tips[c.name] = f"<b>{_h.escape(c.name)}</b> · " + " · ".join(bits)
+                self.model.header_tips = tips
+                return
+            for c in td.columns:
+                lines = [f"<b>{_h.escape(c.name)}</b> · {_h.escape(c.type)}"]
+                if c.primary_key:
+                    lines.append("🔑 <b>Primary key</b>: uniquely identifies each row; other tables point here.")
+                if c.name in fks:
+                    fk = fks[c.name]
+                    lines.append(f"🔗 <b>Foreign key</b> → {_h.escape(fk.ref_table)}.{_h.escape(fk.ref_columns[0])}: each row points to one "
+                                 f"{_h.escape(fk.ref_table)} row, and the value must exist there.")
+                if not c.nullable and not c.primary_key:
+                    lines.append("Required (NOT NULL): every row must have a value.")
+                if c.name in uniq:
+                    lines.append("Unique: no two rows may share a value.")
+                if c.default:
+                    lines.append(f"Default: <code>{_h.escape(c.default)}</code> when left empty.")
+                if c.name in roles:
+                    lines.append(_h.escape(roles[c.name].label()))
+                tips[c.name] = "<br>".join(lines)
+            self.model.header_tips = tips
+
+        run_async(work, done)
+
     def _update_actions(self) -> None:
         editable = self.model.editable
         for a in (self.add_act, self.del_act, self.null_act):
             a.setEnabled(editable)
+        self.check_all_box.setEnabled(editable)
+        self._checks_changed()
         self.apply_act.setEnabled(self.model.dirty)
         self.discard_act.setEnabled(self.model.dirty)
         limit = self.page_size.currentData()
@@ -237,6 +319,44 @@ class DataTab(QWidget):
             self.model.toggle_delete(rows)
             self._update_actions()
 
+    # ---- checked rows -------------------------------------------------------------------
+    def _checks_changed(self) -> None:
+        n = len(self.model.checked)
+        total = len(self.model.rows)
+        self.checked_label.setText(f" {n} checked " if n else "")
+        self.del_checked_act.setEnabled(self.model.editable and n > 0)
+        self.upd_checked_act.setEnabled(self.model.editable and n > 0)
+        self.check_all_box.blockSignals(True)
+        self.check_all_box.setCheckState(Qt.CheckState.Checked if n and n == total else
+                                         Qt.CheckState.PartiallyChecked if n else Qt.CheckState.Unchecked)
+        self.check_all_box.blockSignals(False)
+        self.grid.verticalHeader().viewport().update()
+
+    def delete_checked(self) -> None:
+        rows = [r for r in self.model.checked_rows() if r not in self.model.deleted]
+        if not rows:
+            return
+        self.model.toggle_delete(rows)
+        self.model.check_all(False)
+        self.status.setText(f"{len(rows)} row(s) marked for deletion. Click Apply to delete them, or Discard to cancel.")
+        self._update_actions()
+
+    def update_checked(self) -> None:
+        rows = [r for r in self.model.checked_rows() if r not in self.model.deleted]
+        if not rows:
+            return
+        cols = [c for i, c in enumerate(self.model.columns)
+                if c not in self.model.primary_key and not (self.model.roles.get(i) and self.model.roles[i].kind == "media")]
+        dlg = BulkUpdateDialog(cols, len(rows), self.model.roles, self.model.columns, self)
+        if not dlg.exec():
+            return
+        col = self.model.columns.index(dlg.column)
+        for r in rows:
+            self.model.set_cell(r, col, dlg.value)
+        shown = "NULL" if dlg.value is None else repr(dlg.value)
+        self.status.setText(f"{dlg.column} = {shown} staged on {len(rows)} row(s). Click Apply to save, or Discard to cancel.")
+        self._update_actions()
+
     def set_null(self) -> None:
         if not self.model.editable:
             return
@@ -271,6 +391,9 @@ class DataTab(QWidget):
             return s.apply_changes(self.table, self.schema, ups, ins, deletes)
 
         def done(n):
+            from dbide.core.progress import progress
+
+            progress().record("edit_data")
             secured = [c for c, r in roles.items() if r.kind in ("password", "encrypted")]
             note = f" Values in {', '.join(secured)} were hashed/encrypted automatically." if secured else ""
             self.status.setText(f"Saved: {n} row(s) affected.{note}")
@@ -322,7 +445,7 @@ class DataTab(QWidget):
                                           "encrypted": "<p>Type a value; it's encrypted with this connection's key when you Apply. "
                                                        "Right-click → <i>Reveal</i> to decrypt.</p>",
                                           "media": "<p>Right-click → <i>Insert Image/Video…</i> to add a file; double-click to view it "
-                                                   "and see where it is stored.</p>"}[rob.kind])
+                                                   "and see where it is stored.</p>"}[rob.kind], teaching=False)
 
     def _double_clicked(self, idx) -> None:
         rob = self.model.roles.get(idx.column())
@@ -349,6 +472,27 @@ class DataTab(QWidget):
             self.model.set_roles(roles)
         self.model.set_cell(r, c, dlg.value)
         self.status.setText("Media staged. Click Apply to save it.")
+
+    def open_media_folder(self) -> None:
+        """Show where this column's files live (the folder in Finder)."""
+        from pathlib import Path
+
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+
+        from dbide.core import media as _media
+
+        r, c, rob = self._current()
+        folder = None
+        if r is not None:
+            v = self.model.value(r, c)
+            if isinstance(v, str) and v:
+                folder = _media.resolve(v, self.session.cfg).parent
+        if folder is None:
+            folder = Path(rob.folder) if rob is not None and rob.folder else _media.default_folder(self.session.cfg)
+        folder.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+        self.status.setText(f"Media folder: {folder}")
 
     def view_media(self) -> None:
         r, c, _ = self._current()
@@ -396,3 +540,47 @@ class DataTab(QWidget):
 
     def shutdown(self) -> None:
         pass
+
+
+class BulkUpdateDialog(QDialog):
+    """Set one column to the same value on every checked row."""
+
+    def __init__(self, columns: list[str], n_rows: int, roles: dict, all_columns: list[str], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Update {n_rows} checked row(s)")
+        self.setMinimumWidth(440)
+        self.column = columns[0] if columns else ""
+        self.value = None
+        form = QFormLayout(self)
+        self.col = QComboBox()
+        self.col.addItems(columns)
+        self.val = QLineEdit()
+        self.val.setPlaceholderText("new value (text, number or date as you'd type it in a cell)")
+        self.null = QCheckBox("Set to NULL (no value)")
+        self.null.toggled.connect(lambda on: self.val.setEnabled(not on))
+        self.note = QLabel()
+        self.note.setObjectName("Muted")
+        self.note.setWordWrap(True)
+        role_by_name = {all_columns[i]: r for i, r in roles.items()}
+
+        def sync(*_):
+            r = role_by_name.get(self.col.currentText())
+            extra = f" Values are {('hashed' if r.kind == 'password' else 'encrypted')} automatically." if r is not None and r.kind in ("password", "encrypted") else ""
+            self.note.setText(f"Changes {n_rows} row(s). Nothing is saved until you click Apply.{extra}")
+
+        self.col.currentTextChanged.connect(sync)
+        sync()
+        form.addRow("Column", self.col)
+        form.addRow("Value", self.val)
+        form.addRow("", self.null)
+        form.addRow("", self.note)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.button(QDialogButtonBox.StandardButton.Ok).setText("Stage Update")
+        bb.accepted.connect(self._ok)
+        bb.rejected.connect(self.reject)
+        form.addRow(bb)
+
+    def _ok(self) -> None:
+        self.column = self.col.currentText()
+        self.value = None if self.null.isChecked() else self.val.text()
+        self.accept()

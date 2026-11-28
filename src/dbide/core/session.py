@@ -42,9 +42,15 @@ class DatabaseSession:
     def __init__(self, cfg: ConnectionConfig, password: str | None = None):
         self.cfg = cfg
         self.driver = get_driver(cfg.driver)
-        self.engine = create_engine(self.driver.url(cfg, password), **self.driver.engine_kwargs(cfg))
-        self.driver.install_hooks(self.engine)
+        # no_parameters: SQL typed by the user (or generated without bind values) goes to the driver untouched.
+        # Otherwise psycopg / PyMySQL / pymssql treat every % as a placeholder and `LIKE '%a%'` or `10 % 3` fail.
+        self.engine = create_engine(self.driver.url(cfg, password), execution_options={"no_parameters": True},
+                                    **self.driver.engine_kwargs(cfg))
+        self.driver.install_hooks(self.engine, cfg)
         self.server_version = ""
+        # called (from a worker thread) right before anything is written; the Playground snapshots here
+        self.before_write = None
+        self.time_limit: float | None = cfg.options.get("time_limit")
 
     # ---- lifecycle --------------------------------------------------------
     def connect(self) -> str:
@@ -113,6 +119,10 @@ class DatabaseSession:
                     catalog[t] = []
         return catalog
 
+    def _about_to_write(self, what: str) -> None:
+        if self.before_write is not None:
+            self.before_write(what)
+
     # ---- table data -------------------------------------------------------
     def fetch_page(
         self,
@@ -136,7 +146,7 @@ class DatabaseSession:
         with self.engine.connect() as conn:
             total = conn.exec_driver_sql(f"SELECT COUNT(*) FROM {src}{where_sql}").scalar() or 0
             res = conn.exec_driver_sql(
-                f"SELECT * FROM {src}{where_sql}{order_sql} LIMIT {int(limit)} OFFSET {int(offset)}"
+                self.driver.select_limit(f"SELECT * FROM {src}{where_sql}", int(limit), int(offset), order_sql.strip())
             )
             cols = list(res.keys())
             rows = [list(r) for r in res.fetchall()]
@@ -154,6 +164,7 @@ class DatabaseSession:
         q = self.driver.quote
         t = self.driver.qualify(table, schema)
         affected = 0
+        self._about_to_write("edit rows in " + table)
 
         def where_clause(keys: dict, prefix: str) -> tuple[str, dict]:
             parts, params = [], {}
@@ -184,7 +195,7 @@ class DatabaseSession:
                     params = {f"v{i}": v for i, v in enumerate(values.values())}
                     conn.execute(text(f"INSERT INTO {t} ({cols}) VALUES ({ph})"), params)
                 else:
-                    conn.exec_driver_sql(f"INSERT INTO {t} DEFAULT VALUES" if self.cfg.driver == "sqlite" else f"INSERT INTO {t} () VALUES ()")
+                    conn.exec_driver_sql(self.driver.insert_default_row_sql(t))
                 affected += 1
         return affected
 
@@ -210,16 +221,35 @@ class DatabaseSession:
         q = self.driver.quote
         cols = ", ".join(q(c) for c in columns)
         ph = ", ".join(f":p{i}" for i in range(len(columns)))
-        sql = text(f"INSERT INTO {self.driver.qualify(table, schema)} ({cols}) VALUES ({ph})")
+        qualified = self.driver.qualify(table, schema)
+        sql = text(f"INSERT INTO {qualified} ({cols}) VALUES ({ph})")
+        self._about_to_write(f"import into {table}")
         with self.engine.begin() as conn:
+            # explicit values for an auto-numbered column need help on some servers
+            identity = [c for c in self._identity_columns(conn, table, schema) if c in columns]
+            if identity:
+                for stmt in self.driver.before_explicit_ids(qualified):
+                    conn.exec_driver_sql(stmt)
             for start in range(0, len(rows), 500):
                 chunk = rows[start : start + 500]
                 conn.execute(sql, [{f"p{i}": v for i, v in enumerate(r)} for r in chunk])
+            for col in identity:
+                for stmt in self.driver.after_explicit_ids(table, schema, col):
+                    conn.exec_driver_sql(stmt)
         return len(rows)
+
+    def _identity_columns(self, conn, table: str, schema: str | None) -> list[str]:
+        if not (self.driver.before_explicit_ids("x") or self.driver.after_explicit_ids("x", None, "x")):
+            return []  # SQLite / MySQL accept explicit ids as-is
+        from sqlalchemy import inspect as _inspect
+
+        return [c["name"] for c in _inspect(conn).get_columns(table, schema=schema)
+                if self.driver.is_auto_increment(conn, table, schema, c)]
 
     # ---- DDL --------------------------------------------------------------
     def execute_ddl(self, statements: list[str]) -> None:
         """Run builder-generated statements; roll back on failure where the DB allows."""
+        self._about_to_write("change the schema")
         with self.engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
             wrap = self.driver.ddl_transactional and not any(s.upper() == "BEGIN" for s in statements)
             if wrap:
@@ -237,8 +267,24 @@ class DatabaseSession:
                 raise
 
     def execute(self, sql: str) -> None:
+        if not is_read_only(sql):
+            self._about_to_write(sql)
         with self.engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
             conn.exec_driver_sql(sql)
+
+
+def is_read_only(sql: str) -> bool:
+    """Statements that never change data (best effort, used to decide when to snapshot)."""
+    words = sql.lstrip().split(None, 1)
+    head = words[0].upper().strip("(") if words else ""
+    if head in ("SELECT", "EXPLAIN", "SHOW", "DESCRIBE", "DESC", "VALUES"):
+        return True
+    if head == "WITH":
+        upper = sql.upper()
+        return not any(k in upper for k in ("INSERT ", "UPDATE ", "DELETE ", "REPLACE "))
+    if head == "PRAGMA":
+        return "=" not in sql
+    return False
 
 
 def _all_kinds():
@@ -260,6 +306,7 @@ class QueryConnection:
         self._conn_id = None
         self._lock = threading.Lock()
         self._cancelled = False
+        self._timed_out = False
 
     def _ensure(self):
         if self._conn is None or self._conn.closed or self._conn.invalidated:
@@ -270,8 +317,18 @@ class QueryConnection:
     def run(self, script: str, max_rows: int = 5000, stop_on_error: bool = True) -> list[StatementResult]:
         stmts = split_sql(script, self.session.driver.hash_comments)
         results: list[StatementResult] = []
+        writes = [st.text for st in stmts if not is_read_only(st.text)]
         with self._lock:
             self._cancelled = False
+            if writes:
+                self.session._about_to_write(writes[0] if len(writes) == 1 else f"{len(writes)} statements")
+            timer = None
+            if self.session.time_limit:
+                import threading as _t
+
+                timer = _t.Timer(self.session.time_limit, self._time_up)
+                timer.daemon = True
+                timer.start()
             for st in stmts:
                 if self._cancelled:
                     break
@@ -298,7 +355,22 @@ class QueryConnection:
                 results.append(r)
                 if r.error and stop_on_error:
                     break
+            if timer is not None:
+                timer.cancel()
+            if self._timed_out:
+                for r in results:
+                    if r.error and "interrupt" in r.error.lower():
+                        r.error = (f"TimeLimit: stopped after {self.session.time_limit:g} seconds. In the playground long queries are "
+                                   "stopped automatically, which often means a JOIN is missing its ON condition.")
+                self._timed_out = False
         return results
+
+    def _time_up(self) -> None:
+        self._timed_out = True
+        try:
+            self.cancel()
+        except Exception:
+            pass
 
     def cancel(self) -> None:
         self._cancelled = True

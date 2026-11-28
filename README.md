@@ -1,6 +1,6 @@
 # DB IDE
 
-A local desktop IDE for **SQLite** and **MySQL / MariaDB**, written in Python with PySide6 (Qt).
+A local desktop IDE for **SQLite**, **MySQL / MariaDB**, **PostgreSQL** and **Microsoft SQL Server**, written in Python with PySide6 (Qt).
 
 ## Run
 
@@ -24,8 +24,94 @@ uv run pytest    # run the tests
 
   Each tab has its own connection, so `USE db`, temp tables and manual `BEGIN … COMMIT` persist between runs. Multiple result sets appear as separate tabs, and every run is logged to the query history (`⌘Y`).
 - **Data grid**: page through table rows with a `WHERE` filter and `ORDER BY`. Edit cells, add and delete rows, or set cells to NULL. Changes are staged, color-coded, and applied in a single transaction (`⌘S`). Tables without a primary key are read-only.
+  - **Checkboxes** next to each row number select several rows at once (click a box, or use **Select all**). **Delete Checked** stages all of them for deletion, and **Update Checked…** sets one column to the same value, or to NULL, on every checked row. Both are still staged until you Apply.
 - **Table designer**: create or alter tables visually (columns, types, NOT NULL, PK, auto-increment, defaults, comments, indexes, foreign keys). It shows a live SQL preview, and asks you to confirm the exact statements before running them. In SQLite, changes that `ALTER TABLE` can't make are done with the standard rebuild-and-copy procedure inside a transaction; indexes, triggers, inline UNIQUE constraints and dependent views are preserved.
 - **Import / export**: export tables or query results as CSV, JSON or SQL `INSERT` statements. Import CSV or JSON into a table with column mapping; the import runs in one transaction.
+
+## Two modes
+
+Pick one on first launch. Switch any time from **View → Mode** (⌃⌥1 / ⌃⌥2), the mode button in the toolbar, or the badge in the status bar.
+
+| | **Learning mode**: become a database admin | **Power user mode**: work as a database admin |
+|---|---|---|
+| Lessons | 10 lessons: SQL basics, then admin skills (indexes and query plans, transactions, constraints, health checks and backups, users and permissions) | Hidden |
+| Help | Explains SQL and database concepts, plain-English error tips, keyword tooltips, "are you sure?" prompts | About the software only: tools and shortcuts. Raw errors, no prompts |
+| Tools | Revealed as your skills grow (Beginner → Explorer → Builder → Pro) | All available immediately |
+| First screen | Playground with sample data | Your connections |
+| Playground | ⌘⇧P, toolbar and activity bar | Hidden (not needed) |
+
+**Admin Console** (⌘⇧A, or right-click a database). It's available immediately in Power user mode and at the Pro level in Learning mode.
+- **Overview:** version, size, location, and rows and indexes per table
+- **Maintenance:** integrity check, Analyze, Vacuum/Optimize, and Backup (an exact file copy for SQLite, a SQL dump for the server engines)
+- **Activity:** running queries (MySQL, PostgreSQL, SQL Server), with **Stop**
+- **Users:** accounts and their GRANTs
+- **Settings:** PRAGMAs or server variables
+
+## Playground, templates and growing with you
+
+**Playground** (first thing you see on a fresh install; `⌘⇧P`, or the flask icon) is a private copy of a sample database:
+- It runs **SQL, the grid and the designers**; anything they change can be undone.
+- **Undo safety:** before every change, the whole database is snapshotted. **Undo** steps back, even after `DROP TABLE` (up to 40 steps), and **Reset** rebuilds the sample.
+- **Guard rails:** queries stop after 5 seconds, and `ATTACH` is blocked, so nothing outside the sandbox can be touched.
+- **Try This:** each dataset comes with suggestions (plain English or SQL), each noting what it teaches.
+- **Save as Project…** keeps your work as a real file.
+
+**Templates** (File → New Project from Template…, `⌘⇧N`):
+- **Six projects:** Online Store, Blog, School, Library, Task Tracker, Recipes.
+- **Each includes:** keys, indexes, `ON DELETE` rules, realistic sample data, real image files (stored in the database or on disk), and Argon2id-hashed passwords.
+- **Two ways to use one:** open it in the Playground, or create it as a new SQLite file or inside a MySQL/SQLite database.
+
+**Progressive disclosure.** The IDE notices skills as you use them (your first query, WHERE, ORDER BY, JOIN, GROUP BY, changing data, Undo, creating tables, relationships, lessons, templates). Skills add up to four levels:
+
+| Level | Skills needed | Tools it reveals |
+|---|---|---|
+| Beginner | 0 | Playground, Ask, Run, charts, grid editing, lessons |
+| Explorer | 4 | History, Export/Import, Diagram, Visualize JOIN, chart customization, Schema Designer |
+| Builder | 8 | Table Designer indexes, foreign keys and roles; Run All and Max rows; Password Tool |
+| Pro | 11 | Query plan (EXPLAIN), Security Settings, SQL previews open by default |
+
+- Locked toolbar buttons are hidden. Locked menu items show 🔒 and explain how to unlock them, with **Unlock now**.
+- The trophy icon opens **Your Progress**, which shows your skills, what to try next, and **Show all features now** for experienced developers.
+- SQL the IDE writes for a plain-English question counts as *asking*, not as writing a JOIN yourself.
+
+**Concept tips on demand**
+- **Explain (⇧F1):** click it, then click anything for an explanation.
+- **SQL keywords:** hover over any keyword in the editor for a short explanation.
+- **Column headers:** hover in a data grid to learn what *primary key*, *foreign key → table*, *required* and *unique* mean for that column.
+- **Sidebar:** tables and columns have tips too.
+
+## Visual building, plain-English queries and charts
+
+**Schema Designer** (`⌘⇧D`, or right-click a database → Schema Designer, or **Edit in Designer** on a diagram)
+- Click **Add Table** (it starts with an auto-numbered `id` primary key), then double-click *+ add column* to add fields.
+- To link two tables, drag the ● handle on one table (or on a specific column) onto another. You then choose the relationship:
+  - **One-to-many** adds `parent_id` plus a foreign key and an index.
+  - **One-to-one** does the same, but makes the column UNIQUE.
+  - **Many-to-many** builds a junction table with two foreign keys and a composite primary key.
+
+  Each choice is explained in plain English, and **Advanced options** shows the on-delete rule and the exact SQL.
+- The pending changes list describes every edit in words. Nothing touches the database until **Review & Apply**, which lists the steps (parents before children) and shows the SQL behind **Show SQL**. On SQLite, changes to existing tables use the safe rebuild-and-copy procedure, so existing data is kept.
+- New tables have a dashed border, changed tables show ●. Right-click a line to change the on-delete rule or remove the link.
+
+**Ask in plain English** (the bar above every SQL editor). It runs **fully offline**:
+- It reads the request against your schema and the values stored in your short text columns, so "customers in UK" knows that `UK` is a `country`. Password, encrypted and media columns are never read.
+- It handles:
+  - filters (`over 50`, `between 10 and 60`, `contains 'pro'`, `is empty`, `not paid`) and dates (`in 2024`, `after 2023`)
+  - counts, totals, averages and min/max, with grouping (`per customer`, `by status`)
+  - `top 5` and `newest`
+  - joins along foreign-key paths (`products ordered by Ada` crosses three tables)
+  - `customers without orders`, `products never ordered` and `authors with more than 2 books`
+- It shows how each phrase was understood, flags any words it didn't use, puts the SQL in the editor for you to edit, and runs it. Generated SQL is always read-only (`SELECT`).
+
+**Charts**: every result gets a **Chart** tab. The form is chosen from the data:
+- a single number becomes a stat tile
+- categories with a number become ranked bars
+- dates become a line
+- two numbers become a scatter
+
+It uses a colour-blind-validated palette in both light and dark themes, thin marks, hover readouts that put the value first, and a legend whenever there are two or more series. **Customize** lets you pick the chart type and X/Y columns, and **Save PNG** exports the chart.
+
+**Simple by default, powerful when needed.** In Learning mode, advanced controls (SQL previews, on-delete rules, chart customization) start folded behind one click. In Power user mode they start open.
 
 ## Look & layout
 
@@ -48,7 +134,7 @@ uv run pytest    # run the tests
 
 ## Learning features
 
-- **Beginner mode** (View menu, on by default): the Help panel explains every button you hover over, the SQL keyword under your cursor, and the designer field you're editing. Statements are explained in plain English when you run them, and it asks before risky ones such as `DELETE` or `UPDATE` without `WHERE`, or `DROP`.
+- **Learning mode** (View → Mode): the Help panel explains every button you hover over, the SQL keyword under your cursor, and the designer field you're editing. Statements are explained in plain English when you run them, and it asks before risky ones such as `DELETE` or `UPDATE` without `WHERE`, or `DROP`.
 - **Help panel**: plain-English explanations of database errors (unknown table, duplicate key, foreign key violation, …) with suggested fixes, plus a set of concept explainers.
 - **Explain in English** (`⌘⇧E`): describes what the current statement will do before you run it.
 - **Visualize JOIN** (`⌘J`): draws the joined tables with the linking columns and a Venn diagram of the join type. It counts matched and unmatched rows from your real data and shows sample rows.
@@ -63,6 +149,16 @@ Right-click a database and choose **Diagram (ERD)**, or press `⌘D`. Tables sho
 - Boxes can be dragged, and positions are remembered. Diagrams export to PNG or SVG.
 
 ## Column roles & security
+
+**Special types in every Type dropdown.** Below the normal SQL types, every Type dropdown also offers these, in both the Table Designer and the Schema Designer:
+
+- 🔑 Password (hashed)
+- 🔒 Encrypted text
+- 🖼 / 📁 Image, 🎬 Video or 📎 File, each either **stored in the database** or saved as a **file on disk**
+
+Picking one sets the right SQL type and the column's role together. One click on a Type or Role cell opens its dropdown.
+
+**Where media files go.** Files saved "on disk" are copied to `<database name>_media/` next to an SQLite file (or `~/.dbide/media/<connection>/` for MySQL). The **Insert Image/Video…** dialog shows the exact folder, with **Change…** (remembered per column) and **Open Folder**. Hovering over a media cell shows the file's full location and warns if it's missing; right-click → **Open Media Folder** opens it in Finder. Paths inside the database's own folder are stored relative to it, so the database and its media can be moved together.
 
 Set a column's **Role** in the table designer. Roles are stored by the IDE (`~/.dbide/column_roles.json`), so the database itself stays plain.
 
@@ -91,8 +187,15 @@ src/dbide/
               help panel, lessons, media viewer, security dialogs
 ```
 
-## Adding PostgreSQL
+## Supported engines
 
-1. Run `uv sync --extra postgres` to install psycopg.
-2. Add `drivers/postgres.py` with a `Driver` subclass (URL, `alter_table_sql`, `cancel` via `pg_cancel_backend`).
-3. Register it in `drivers/__init__.py`.
+| Engine | Python driver | Defaults in New Connection | Notes |
+|---|---|---|---|
+| SQLite | built in | a file | Backup is an exact file copy |
+| MySQL / MariaDB | PyMySQL | port 3306, user `root` | SSL option |
+| PostgreSQL | psycopg 3 | port 5432, user and database `postgres` | Schemas shown in the sidebar; SSL option (`sslmode=require`); a host starting with `/` is a Unix socket folder |
+| SQL Server | pymssql | port 1433, user `sa`, database `master` | `[ ]` quoting, `TOP`/`OFFSET…FETCH` paging, `IDENTITY` columns. EXPLAIN isn't available |
+
+PostgreSQL is tested against a real server (the dev-only `pgserver` package starts a throwaway one during `uv run pytest`). SQL Server is tested through the SQL the app generates, without a live server.
+
+Adding another engine means writing a `Driver` subclass in `drivers/` (URL, quoting, paging, CREATE/ALTER generation, cancel) and registering it in `drivers/__init__.py`.

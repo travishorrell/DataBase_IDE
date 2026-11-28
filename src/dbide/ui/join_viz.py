@@ -189,7 +189,7 @@ class JoinStepView(QWidget):
         self._lay.addWidget(self.diagram)
         self._lay.addWidget(self.stats_label)
         self._lay.addWidget(self.samples, 1)
-        queries = join_stat_queries(self.step, self.session.driver.quote, self.session.driver.qualify)
+        queries = join_stat_queries(self.step, self.session.driver.quote, self.session.driver.qualify, self.session.driver.select_limit)
         s = self.session
 
         def work():

@@ -117,11 +117,12 @@ def _media_info(session, schema, table, col: ErdColumn, storage: str, location: 
     try:
         with session.engine.connect() as conn:
             if storage == "blob":
-                row = conn.exec_driver_sql(f"SELECT COUNT({q(col.name)}), SUM(LENGTH({q(col.name)})) FROM {t}").fetchone()
+                ln = session.driver.length_fn
+                row = conn.exec_driver_sql(f"SELECT COUNT({q(col.name)}), SUM({ln}({q(col.name)})) FROM {t}").fetchone()
                 info.rows, info.total_bytes = int(row[0] or 0), int(row[1] or 0)
             else:
                 values = [r[0] for r in conn.exec_driver_sql(
-                    f"SELECT {q(col.name)} FROM {t} WHERE {q(col.name)} IS NOT NULL LIMIT 5000").fetchall()]
+                    session.driver.select_limit(f"SELECT {q(col.name)} FROM {t} WHERE {q(col.name)} IS NOT NULL", 5000)).fetchall()]
                 info.rows = len(values)
                 root = None
                 if col.role is not None:

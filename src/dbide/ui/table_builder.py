@@ -1,8 +1,10 @@
 """Visual CREATE / ALTER TABLE designer with live SQL preview."""
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+import shiboken6
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
+    QApplication,
     QComboBox,
     QFormLayout,
     QHBoxLayout,
@@ -20,7 +22,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from dbide.core.roles import ColumnRole, looks_like_password, role_choices, role_store, suggested_type
+from dbide.core.roles import ColumnRole, from_smart, looks_like_password, role_choices, role_store, suggested_type, type_choices
 from dbide.core.schema_model import FK_ACTIONS, ColumnDef, ForeignKeyDef, IndexDef, TableDef
 from dbide.ui.connections import ConnectionManager
 from dbide.ui.help_panel import HelpCenter, tag
@@ -31,31 +33,108 @@ ORIG_ROLE = Qt.ItemDataRole.UserRole + 1
 CONSTRAINT_ROLE = Qt.ItemDataRole.UserRole + 2
 
 
-class _ComboDelegate(QStyledItemDelegate):
-    def __init__(self, items: list[str], editable: bool, parent=None):
+def open_dropdown(view, index) -> bool:
+    """Start editing `index`, first finishing any other cell being edited.
+
+    Qt refuses to open a second editor, and the old editor's focus-out arrives a
+    moment later and would close the new dropdown again, so when another cell is
+    being edited we finish it and open the dropdown on the next event-loop turn.
+    """
+    if view.state() == view.State.EditingState:
+        # open cell editors are visible children of the viewport (works even if the window isn't focused)
+        for w in [c for c in view.viewport().children() if isinstance(c, QWidget) and c.isVisible()]:
+            view.commitData(w)
+            view.closeEditor(w, QStyledItemDelegate.EndEditHint.NoHint)
+        view.setCurrentIndex(index)
+        QTimer.singleShot(0, lambda: shiboken6.isValid(view) and view.edit(index))
+        return True
+    view.setCurrentIndex(index)
+    view.edit(index)
+    return view.state() == view.State.EditingState
+
+
+class CellCombo(QComboBox):
+    """Dropdown used inside table cells.
+
+    When its list closes, focus returns to the combo itself, not the table, so the
+    cell editor isn't treated as finished and doesn't vanish before you choose.
+    """
+
+    picked = Signal()  # a real choice by the user (not the spurious 'activated' Qt fires while opening)
+
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self.items, self.editable = items, editable
+        self._opened_at = 0.0
+        self.activated.connect(self._maybe_picked)
+
+    def showPopup(self) -> None:
+        import time
+
+        self._opened_at = time.monotonic()
+        super().showPopup()
+
+    def _maybe_picked(self, _index: int) -> None:
+        import time
+
+        # Qt can emit 'activated' from inside showPopup(); only accept choices made after the list was open
+        if self._opened_at and time.monotonic() - self._opened_at > 0.15:
+            self.picked.emit()
+
+    def keyPressEvent(self, e) -> None:
+        super().keyPressEvent(e)
+        if e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.picked.emit()
+
+    def hidePopup(self) -> None:
+        super().hidePopup()
+        if shiboken6.isValid(self) and self.isVisible():
+            self.setFocus()
+
+
+def _popup_soon(cb: QComboBox) -> None:
+    """Open the list as soon as the editor appears, so one click is enough."""
+    QTimer.singleShot(0, lambda: shiboken6.isValid(cb) and cb.isVisible() and cb.showPopup())
+
+
+class _ComboDelegate(QStyledItemDelegate):
+    """A dropdown editor; '' entries become separators. Choosing an item commits immediately."""
+
+    def __init__(self, items: list[str], editable: bool, parent=None, on_pick=None):
+        super().__init__(parent)
+        self.items, self.editable, self.on_pick = items, editable, on_pick
 
     def createEditor(self, parent, option, index):
-        cb = QComboBox(parent)
+        cb = CellCombo(parent)
         cb.setEditable(self.editable)
-        cb.addItems(self.items)
+        cb.setMaxVisibleItems(20)
+        for it in self.items:
+            if it == "":
+                cb.insertSeparator(cb.count())
+            else:
+                cb.addItem(it)
+        cb.picked.connect(lambda cb=cb: (self.commitData.emit(cb), self.closeEditor.emit(cb)))
+        _popup_soon(cb)
         return cb
 
     def setEditorData(self, editor, index):
         editor.setCurrentText(index.data() or "")
 
     def setModelData(self, editor, model, index):
-        model.setData(index, editor.currentText())
+        text = editor.currentText()
+        if self.on_pick and self.on_pick(index.row(), text):
+            return  # a special type: the hook filled in the type and role
+        model.setData(index, text)
 
 
 class _RoleDelegate(QStyledItemDelegate):
     """Combo of column roles; stores the role code in UserRole and shows its label."""
 
     def createEditor(self, parent, option, index):
-        cb = QComboBox(parent)
+        cb = CellCombo(parent)
         for label, code in role_choices():
             cb.addItem(label, code)
+        cb.picked.connect(lambda cb=cb: (self.commitData.emit(cb), self.closeEditor.emit(cb)))
+        _popup_soon(cb)
         return cb
 
     def setEditorData(self, editor, index):
@@ -154,8 +233,10 @@ class TableBuilderTab(QWidget):
             form.addRow("Comment", self.table_comment)
 
         self.cols = _Grid(["Name", "Type", "Not Null", "PK", "Auto Inc", "Default", "Comment", "Role"], self.add_column)
-        self.cols.table.setItemDelegateForColumn(self.C_TYPE, _ComboDelegate(drv.common_types, True, self))
+        self.cols.table.setItemDelegateForColumn(self.C_TYPE, _ComboDelegate(type_choices(drv.common_types), True, self, self._pick_type))
         self.cols.table.setItemDelegateForColumn(self.C_ROLE, _RoleDelegate(self))
+        # one click on a Type or Role cell opens its dropdown
+        self.cols.table.clicked.connect(lambda ix: ix.column() in (self.C_TYPE, self.C_ROLE) and open_dropdown(self.cols.table, ix))
         if drv.key != "mysql":
             self.cols.table.setColumnHidden(self.C_COMMENT, True)
         self.cols.table.itemChanged.connect(self._changed)
@@ -171,6 +252,7 @@ class TableBuilderTab(QWidget):
         self.fks.table.currentCellChanged.connect(lambda r, c, *_: self._explain_fk(r, c))
         self.fks.table.itemChanged.connect(lambda it: self._explain_fk(it.row(), it.column()))
         action_delegate = _ComboDelegate(FK_ACTIONS, False, self)
+        self.fks.table.clicked.connect(lambda ix: ix.column() in (4, 5) and open_dropdown(self.fks.table, ix))
         self.fks.table.setItemDelegateForColumn(4, action_delegate)
         self.fks.table.setItemDelegateForColumn(5, action_delegate)
         self.fks.table.itemChanged.connect(self._changed)
@@ -185,6 +267,12 @@ class TableBuilderTab(QWidget):
         self.tabs.addTab(self.cols, "Columns")
         self.tabs.addTab(self.idx, "Indexes")
         self.tabs.addTab(self.fks, "Foreign Keys")
+        from dbide.ui.features import Gate
+
+        Gate.get().bind_tab(self.tabs, self.idx, "table_advanced")
+        Gate.get().bind_tab(self.tabs, self.fks, "table_advanced")
+        self._gate_role_column()
+        Gate.get().on(Gate.get().changed, self, lambda _l: self._gate_role_column())
         self.tabs.addTab(self.preview, "SQL Preview")
         self.tabs.currentChanged.connect(lambda i: self.tabs.widget(i) is self.preview and self.update_preview())
 
@@ -334,12 +422,33 @@ class TableBuilderTab(QWidget):
 
     def add_column(self) -> None:
         n = self.cols.table.rowCount() + 1
-        default_type = "VARCHAR(255)" if self.driver.key == "mysql" else "TEXT"
+        default_type = {"mysql": "VARCHAR(255)", "postgresql": "VARCHAR(255)", "mssql": "NVARCHAR(255)"}.get(self.driver.key, "TEXT")
         self._add_column_row(ColumnDef(f"column_{n}", default_type))
         r = self.cols.table.rowCount() - 1
         self.cols.table.setCurrentCell(r, self.C_NAME)
         self.cols.table.editItem(self.cols.table.item(r, self.C_NAME))
         self._changed()
+
+    def _gate_role_column(self) -> None:
+        import shiboken6 as _sh
+
+        from dbide.ui.features import Gate
+
+        if _sh.isValid(self.cols.table):
+            # beginners use the special types in the Type dropdown; the Role column is the advanced view of the same thing
+            self.cols.table.setColumnHidden(self.C_ROLE, not Gate.get().allowed("table_advanced"))
+
+    def _pick_type(self, row: int, text: str) -> bool:
+        """A special type ('Password (hashed)', 'Image (file on disk)'…) sets the SQL type and the role together."""
+        role = from_smart(text)
+        if role is None:
+            return False
+        t = self.cols.table
+        t.item(row, self.C_TYPE).setText(suggested_type(role, self.driver.key))
+        ri = t.item(row, self.C_ROLE)
+        ri.setData(Qt.ItemDataRole.UserRole, role.code())
+        ri.setText(role.label())  # triggers _column_item_changed → explanation in the Help panel
+        return True
 
     def current_roles(self) -> dict[str, ColumnRole]:
         t = self.cols.table
@@ -533,6 +642,11 @@ class TableBuilderTab(QWidget):
         old_name = self.original.name if self.original else None
 
         def done(_):
+            from dbide.core.progress import progress
+
+            progress().record("create_table" if not old_name else "edit_data")
+            if td.foreign_keys:
+                progress().record("relationship")
             if old_name and old_name != td.name:
                 role_store().drop_table(self.conn_id, self.schema, old_name)
             role_store().set_table(self.conn_id, self.schema, td.name, roles)

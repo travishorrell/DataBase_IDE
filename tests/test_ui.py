@@ -41,7 +41,7 @@ def test_query_builder_and_grid(win, qtbot):
     )
     tab.run(all_=True)
     qtbot.waitUntil(lambda: not tab.running, timeout=5000)
-    assert tab.results.count() == 2  # Messages + Result
+    assert [tab.results.tabText(i) for i in range(tab.results.count())] == ["Messages", "Result 1", "Chart"]
     grid = tab.results.widget(1)
     assert grid.model().rowCount() == 2
     assert "3 statement(s)" in tab.status.text()

@@ -3,10 +3,12 @@
 To add an engine (e.g. PostgreSQL): subclass Driver in a new module and add it here.
 """
 from .base import Driver
+from .mssql import MSSQLDriver
 from .mysql import MySQLDriver
+from .postgres import PostgresDriver
 from .sqlite import SQLiteDriver
 
-_DRIVERS: dict[str, Driver] = {d.key: d for d in (SQLiteDriver(), MySQLDriver())}
+_DRIVERS: dict[str, Driver] = {d.key: d for d in (SQLiteDriver(), MySQLDriver(), PostgresDriver(), MSSQLDriver())}
 
 
 def get_driver(key: str) -> Driver:

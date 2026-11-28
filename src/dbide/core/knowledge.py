@@ -130,6 +130,33 @@ COMMANDS: T = {
     "cmd:lessons": ("Lessons", "Step-by-step tutorials on a practice database. They check your work as you go."),
     "cmd:beginner": ("Beginner mode", "Turns on extra explanations and safety checks, such as warning before UPDATE or DELETE without WHERE and explaining statements before they run."),
     "cmd:password_tool": ("Password & Encryption Tool", "Hash a password with bcrypt/Argon2id/PBKDF2/scrypt, check a password against a hash, or encrypt/decrypt a value with this connection's key."),
+    "cmd:ask": ("Ask in plain English", "Type what you want, like <i>customers in UK with more than 2 orders</i>, and press Enter. "
+                "The IDE writes the SQL (offline, using your table names and stored values), shows how it read each phrase, "
+                "puts the SQL in the editor and runs it. Generated SQL only reads data. Edit it freely; it's a starting point."),
+    "cmd:chart": ("Chart", "An automatic chart of the result: a single number becomes a stat tile, categories with a number become "
+                  "ranked bars, dates become a line, two numbers become a scatter. Hover for exact values. "
+                  "<b>Customize</b> lets you pick the chart type and columns. The Result tab always has the full table."),
+    "cmd:designer": ("Schema Designer", "Build your database visually. <b>Add Table</b>, then drag from the ● handle on one table to another "
+                     "to link them. You'll choose one-to-many, one-to-one or many-to-many and see what that means. Nothing changes in the "
+                     "database until <b>Review &amp; Apply</b>, which lists every step in plain English with the exact SQL."),
+    "cmd:playground": ("Playground", "A private copy of a sample database (an online store, blog, school…). Run anything, even DELETE or DROP TABLE: "
+                       "every change is snapshotted first, so <b>Undo</b> brings it back and <b>Reset</b> starts fresh. Long queries stop after 5 seconds."),
+    "cmd:undo": ("Undo", "Puts the playground database back exactly as it was before your last change. You can undo many steps."),
+    "cmd:templates": ("Templates", "Ready-made projects with tables, relationships and realistic sample data. Open one in the Playground to explore safely, "
+                      "or create it for real as a new SQLite file or inside a MySQL database."),
+    "cmd:whats_this": ("Explain anything", "Click <b>Explain</b> (⇧F1), then click any button, field or panel and a short explanation pops up."),
+    "cmd:progress": ("Your progress", "The IDE notices the skills you use (filtering, joins, creating tables…). Each level reveals more tools, so beginners "
+                     "see a simpler screen. Turn on <b>Show all features</b> any time."),
+    "cmd:check_rows": ("Checked rows", "Tick the box at the left of each row (or <b>Select all</b>) to work on many rows at once. "
+                       "<b>Delete Checked</b> marks them for deletion; <b>Update Checked…</b> sets one column to the same value on all of them. "
+                       "Like every grid edit, nothing is saved until you click <b>Apply</b>, and <b>Discard</b> cancels."),
+    "cmd:mode": ("Learning vs Power user mode", "<b>Learning mode</b> teaches you to be a database admin: lessons, a safe playground, "
+                 "explanations of SQL and database concepts, safety prompts, and tools that unlock as you learn. "
+                 "<b>Power user mode</b> is for working admins: every tool at once, no prompts, and help about the software only. "
+                 "Switch with View → Mode (⌃⌥1 / ⌃⌥2)."),
+    "cmd:admin": ("Admin Console", "Everyday database administration: <b>Overview</b> (size, version, rows and indexes per table), "
+                  "<b>Maintenance</b> (integrity check, Analyze, Vacuum/Optimize, Backup), <b>Activity</b> (running queries on a "
+                  "MySQL server, with Stop), <b>Users</b> (accounts and GRANTs) and <b>Settings</b> (server variables / PRAGMAs). ⌘⇧A."),
     "cmd:appearance": ("Appearance", "Switch between light and dark mode, pick a theme and accent colour, and change fonts, density and zoom. ⌘⇧L toggles light/dark; ⌘+ and ⌘− zoom."),
     "cmd:security": ("Security Settings", "Choose where the IDE keeps its own secrets (saved logins and encryption keys): the system keychain, an encrypted vault file with a master password, or nowhere."),
     "cmd:design": ("Design Table", "Change columns, keys, indexes and column roles of an existing table."),
@@ -165,6 +192,8 @@ FIELDS: T = {
 }
 
 CONCEPTS: T = {
+    "concept:playground": ("Safe experimenting", "Real databases have no undo button. In the playground you get one: every change is copied first, "
+                           "so mistakes are free. In real projects, transactions (BEGIN … ROLLBACK) and backups play that role."),
     "concept:pk": ("Primary keys", "A primary key is the unique ID of a row. Other tables use it to point at that row. Rules: unique, never NULL, and ideally never changes. "
                    "A simple auto-incrementing <code>id</code> is the most common choice."),
     "concept:fk": ("Foreign keys & relationships", "A foreign key column holds the primary key of a row in another table. That creates a <b>relationship</b>:<ul>"
@@ -193,6 +222,22 @@ TOPICS: T = {**{f"kw:{k}": v for k, v in KEYWORDS.items()}, **COMMANDS, **FIELDS
 
 def topic(key: str) -> tuple[str, str] | None:
     return TOPICS.get(key)
+
+
+def short_tip(key: str, max_len: int = 260) -> str | None:
+    """A compact HTML tooltip: title + the first sentence or two of the explanation."""
+    t = topic(key)
+    if not t:
+        return None
+    title, body = t
+    plain = re.sub(r"<pre>.*?</pre>", " ", body, flags=re.S)
+    plain = re.sub(r"<li>", " • ", plain)
+    plain = re.sub(r"<[^>]+>", "", plain)
+    plain = " ".join(plain.split())
+    if len(plain) > max_len:
+        cut = plain[:max_len]
+        plain = cut[: cut.rfind(". ") + 1] if ". " in cut else cut.rstrip() + "…"
+    return f"<b>{title}</b><br>{plain}<br><i>⇧F1 or the Help panel for more</i>"
 
 
 def keyword_topic(word: str) -> str | None:

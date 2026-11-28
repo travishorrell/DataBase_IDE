@@ -114,6 +114,15 @@ class ConnectionDialog(QDialog):
         self.pages.setCurrentIndex(0 if drv.file_based else 1)
         if not drv.file_based and drv.default_port and not self.cfg:
             self.port.setValue(drv.default_port)
+            defaults = {"mysql": ("root", ""), "postgresql": ("postgres", "postgres"), "mssql": ("sa", "master")}
+            user, db = defaults.get(drv.key, ("", ""))
+            if self.user.text() in ("", "root", "postgres", "sa"):
+                self.user.setText(user)
+            if self.database.text() in ("", "postgres", "master"):
+                self.database.setText(db)
+            self.database.setPlaceholderText({"mysql": "optional default database", "postgresql": "database (default: postgres)",
+                                              "mssql": "database (default: master)"}.get(drv.key, ""))
+            self.ssl.setVisible(drv.key in ("mysql", "postgresql"))
 
     def _browse(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Open SQLite database", "", "SQLite (*.db *.sqlite *.sqlite3 *.db3);;All files (*)")

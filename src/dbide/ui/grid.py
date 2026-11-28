@@ -3,9 +3,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QRect, Qt, Signal
 from PySide6.QtGui import QAction, QBrush, QColor, QFont, QGuiApplication, QKeySequence, QPalette
-from PySide6.QtWidgets import QAbstractItemView, QHeaderView, QMenu, QTableView
+from PySide6.QtWidgets import QAbstractItemView, QHeaderView, QMenu, QStyle, QStyleOptionButton, QTableView
 
 from dbide.core import crypto
 from dbide.core.media import detect_mime, human_size, kind_from_mime
@@ -64,7 +64,11 @@ class ResultModel(QAbstractTableModel):
             return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         return None
 
+    header_tips: dict = {}
+
     def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
+        if role == Qt.ItemDataRole.ToolTipRole and orientation == Qt.Orientation.Horizontal and section < len(self.columns):
+            return self.header_tips.get(self.columns[section])
         if role != Qt.ItemDataRole.DisplayRole:
             return None
         if orientation == Qt.Orientation.Horizontal:
@@ -86,11 +90,13 @@ class ResultModel(QAbstractTableModel):
 
 
 class EditableTableModel(ResultModel):
+    checks_changed = Signal()
     """Rows of one table with staged edits, inserts and deletes."""
 
     NEW_COLOR = QColor(80, 180, 90, 60)
     EDIT_COLOR = QColor(230, 180, 40, 70)
     DEL_COLOR = QColor(220, 70, 70, 60)
+    CHECK_COLOR = QColor(60, 130, 230, 38)
 
     def __init__(self, parent=None):
         super().__init__(parent=parent)
@@ -98,6 +104,7 @@ class EditableTableModel(ResultModel):
         self.editable = False
         self.roles: dict[int, Any] = {}  # column index -> ColumnRole
         self.revealed: dict[tuple[int, int], str] = {}  # decrypted values shown on request
+        self.resolve_media = None  # callable: stored path -> pathlib.Path (set by the data tab)
         self.reset_page([], [], [])
 
     def set_roles(self, roles_by_name: dict) -> None:
@@ -137,7 +144,13 @@ class EditableTableModel(ResultModel):
             if v is None:
                 return None
             if role == Qt.ItemDataRole.ToolTipRole:
-                return "Double-click to view. Right-click → Insert Image/Video… to replace."
+                where = ""
+                if isinstance(v, str) and self.resolve_media is not None:
+                    path = self.resolve_media(v)
+                    where = f"File: {path}{'' if path.exists() else '  ⚠ MISSING'}\n"
+                elif not isinstance(v, str):
+                    where = "Stored inside the database (BLOB).\n"
+                return where + "Double-click to view. Right-click → Insert Image/Video… to replace."
             if isinstance(v, (bytes, bytearray, memoryview)):
                 return _display(v) if role == Qt.ItemDataRole.DisplayRole else None
             if role == Qt.ItemDataRole.DisplayRole:
@@ -153,8 +166,38 @@ class EditableTableModel(ResultModel):
         self.edits: dict[tuple[int, int], Any] = {}  # (row, col) -> new value
         self.new_rows: set[int] = set()
         self.deleted: set[int] = set()
+        self.checked: set[int] = set()  # rows ticked with the row checkboxes
         self.revealed = {}
         self.endResetModel()
+        self.checks_changed.emit()
+
+    # ---- row checkboxes -------------------------------------------------------------
+    def is_checked(self, row: int) -> bool:
+        return row in self.checked
+
+    def set_checked(self, rows, on: bool) -> None:
+        rows = [r for r in rows if 0 <= r < len(self.rows)]
+        if on:
+            self.checked |= set(rows)
+        else:
+            self.checked -= set(rows)
+        self._repaint_rows()
+        self.checks_changed.emit()
+
+    def toggle_checked(self, row: int) -> None:
+        self.set_checked([row], row not in self.checked)
+
+    def check_all(self, on: bool) -> None:
+        self.set_checked(range(len(self.rows)), on)
+
+    def checked_rows(self) -> list[int]:
+        return sorted(self.checked)
+
+    def _repaint_rows(self) -> None:
+        if self.rows:
+            self.dataChanged.emit(self.index(0, 0), self.index(len(self.rows) - 1, max(0, len(self.columns) - 1)),
+                                  [Qt.ItemDataRole.BackgroundRole])
+            self.headerDataChanged.emit(Qt.Orientation.Vertical, 0, len(self.rows) - 1)
 
     @property
     def dirty(self) -> bool:
@@ -181,6 +224,8 @@ class EditableTableModel(ResultModel):
                 return QBrush(self.NEW_COLOR)
             if (r, index.column()) in self.edits:
                 return QBrush(self.EDIT_COLOR)
+            if r in self.checked:
+                return QBrush(self.CHECK_COLOR)
             return None
         rob = self.roles.get(index.column()) if index.isValid() else None
         if rob is not None and role in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.EditRole, Qt.ItemDataRole.ToolTipRole):
@@ -230,6 +275,7 @@ class EditableTableModel(ResultModel):
                     (x - 1 if x > r else x, c): v for (x, c), v in self.edits.items() if x != r
                 }
                 self.deleted = {x - 1 if x > r else x for x in self.deleted}
+                self.checked = {x - 1 if x > r else x for x in self.checked if x != r}
                 self.endRemoveRows()
             elif r in self.deleted:
                 self.deleted.discard(r)
@@ -336,3 +382,49 @@ class GridView(QTableView):
                 else:
                     menu.addAction(a)
         menu.exec(self.viewport().mapToGlobal(pos))
+
+
+class CheckHeader(QHeaderView):
+    """Row header with a checkbox in front of each row number (click to tick the row)."""
+
+    BOX = 16
+
+    def __init__(self, parent=None):
+        super().__init__(Qt.Orientation.Vertical, parent)
+        self.setSectionsClickable(True)
+        self.setDefaultAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+    def _model(self):
+        m = self.model()
+        return m if isinstance(m, EditableTableModel) and m.editable else None
+
+    def sizeHint(self):
+        sh = super().sizeHint()
+        if self._model() is not None:
+            sh.setWidth(sh.width() + self.BOX + 12)
+        return sh
+
+    def _box_rect(self, rect: QRect) -> QRect:
+        return QRect(rect.left() + 6, rect.center().y() - self.BOX // 2, self.BOX, self.BOX)
+
+    def paintSection(self, painter, rect, logical):
+        painter.save()
+        super().paintSection(painter, rect, logical)
+        painter.restore()
+        m = self._model()
+        if m is None or logical >= len(m.rows):
+            return
+        opt = QStyleOptionButton()
+        opt.rect = self._box_rect(rect)
+        opt.state = QStyle.StateFlag.State_Enabled | (QStyle.StateFlag.State_On if m.is_checked(logical) else QStyle.StateFlag.State_Off)
+        self.style().drawPrimitive(QStyle.PrimitiveElement.PE_IndicatorCheckBox, opt, painter, self)
+
+    def mousePressEvent(self, ev):
+        m = self._model()
+        row = self.logicalIndexAt(ev.position().toPoint())
+        if m is not None and row >= 0 and ev.button() == Qt.MouseButton.LeftButton:
+            m.toggle_checked(row)
+            self.viewport().update()
+            ev.accept()
+            return
+        super().mousePressEvent(ev)

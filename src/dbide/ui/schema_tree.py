@@ -9,7 +9,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QBrush, QColor, QFont
 from PySide6.QtWidgets import QAbstractItemView, QMenu, QTreeWidget, QTreeWidgetItem, QTreeWidgetItemIterator
 
-from dbide.ui.worker import run_async
+from dbide.ui.worker import connect_owned, run_async
 
 if TYPE_CHECKING:
     from dbide.ui.main_window import MainWindow
@@ -36,8 +36,8 @@ class SchemaTree(QTreeWidget):
         from dbide.ui.theme import ThemeManager
 
         ThemeManager.get().on_change(self, self._load_icons)
-        self.manager.connected.connect(self._on_connected)
-        self.manager.disconnected.connect(self._on_disconnected)
+        connect_owned(self.manager.connected, self, self._on_connected)
+        connect_owned(self.manager.disconnected, self, self._on_disconnected)
         self.reload_profiles()
 
     ICON_FOR = {"server": ("database", "muted"), "file": ("table", "muted"), "db": ("database", "accent"),
@@ -194,7 +194,7 @@ class SchemaTree(QTreeWidget):
                 return  # the tree was rebuilt while this was loading
             it.takeChildren()
             if kind == "conn" and session.driver.supports_databases:
-                default = session.cfg.database
+                default = session.driver.default_schema(session.cfg) or session.driver.tree_default_schema
                 for name in result:
                     db = self._item(it, name, "db", kind="db", conn=conn_id, schema=name, lazy=True)
                     if name in session.driver.system_schemas:
@@ -205,7 +205,8 @@ class SchemaTree(QTreeWidget):
                 tables, views = result
                 ft = self._item(it, f"Tables ({len(tables)})", "folder", kind="folder", conn=conn_id, schema=schema, folder="tables")
                 for t in tables:
-                    self._item(ft, t, "table", kind="table", conn=conn_id, schema=schema, table=t, lazy=True)
+                    ti = self._item(ft, t, "table", kind="table", conn=conn_id, schema=schema, table=t, lazy=True)
+                    ti.setToolTip(0, f"Table {t}: rows of data with the same columns.\nDouble-click to browse; expand to see its columns; right-click for more.")
                 fv = self._item(it, f"Views ({len(views)})", "folder", kind="folder", conn=conn_id, schema=schema, folder="views")
                 for v in views:
                     self._item(fv, v, "view", kind="view", conn=conn_id, schema=schema, table=v, lazy=True)
@@ -215,6 +216,9 @@ class SchemaTree(QTreeWidget):
                 for c in cols:
                     label = f"{c['name']}  {c['type']}" + ("" if c["nullable"] else "  NOT NULL")
                     ci = self._item(it, label, "column", kind="column", conn=conn_id, schema=schema, table=d["table"], column=c["name"])
+                    ci.setToolTip(0, f"{c['name']}: {c['type']}"
+                                  + ("\nPrimary key: uniquely identifies each row." if c["pk"] else "")
+                                  + ("" if c["nullable"] else "\nRequired (NOT NULL)."))
                     if c["pk"]:
                         f = QFont(ci.font(0))
                         f.setBold(True)
@@ -260,6 +264,9 @@ class SchemaTree(QTreeWidget):
         d = self.info(it)
         m = QMenu(self)
         main = self.main
+        from dbide.ui.features import Gate
+
+        gate = Gate.get()
         kind = d.get("kind")
         if not kind:
             m.addAction("New Connection…", main.new_connection)
@@ -276,7 +283,9 @@ class SchemaTree(QTreeWidget):
                     m.addAction("Create Database…", lambda: main.create_database(conn))
                 else:
                     m.addAction("Create Table…", lambda: main.design_table(conn, None, None))
-                    m.addAction("Diagram (ERD)", lambda: main.open_erd(conn, None))
+                    m.addAction("Diagram (ERD)", gate.guarded("diagram", lambda: main.open_erd(conn, None), self))
+                    m.addAction("Schema Designer", gate.guarded("designer", lambda: main.open_designer(conn, None), self))
+                    m.addAction("Admin Console", gate.guarded("admin", lambda: main.open_admin(conn, None), self))
                 m.addAction("Refresh", lambda: self.refresh(conn))
                 m.addSeparator()
                 m.addAction("Disconnect", lambda: self.manager.close(conn))
@@ -291,27 +300,32 @@ class SchemaTree(QTreeWidget):
         elif kind == "db":
             m.addAction("New Query", lambda: main.new_query(conn, schema))
             m.addAction("Create Table…", lambda: main.design_table(conn, schema, None))
-            m.addAction("Diagram (ERD)", lambda: main.open_erd(conn, schema))
+            m.addAction("Diagram (ERD)", gate.guarded("diagram", lambda: main.open_erd(conn, schema), self))
+            m.addAction("Schema Designer", gate.guarded("designer", lambda: main.open_designer(conn, schema), self))
+            m.addAction("Admin Console", gate.guarded("admin", lambda: main.open_admin(conn, schema), self))
             m.addAction("Refresh", lambda: self.refresh(conn, schema))
             m.addSeparator()
             m.addAction("Drop Database…", lambda: main.drop_database(conn, schema))
         elif kind == "folder":
             if d.get("folder") == "tables":
                 m.addAction("Create Table…", lambda: main.design_table(conn, schema, None))
-                m.addAction("Diagram (ERD)", lambda: main.open_erd(conn, schema))
+                m.addAction("Diagram (ERD)", gate.guarded("diagram", lambda: main.open_erd(conn, schema), self))
+                m.addAction("Schema Designer", gate.guarded("designer", lambda: main.open_designer(conn, schema), self))
+            m.addAction("Admin Console", gate.guarded("admin", lambda: main.open_admin(conn, schema), self))
             m.addAction("Refresh", lambda: self.refresh(conn, schema))
         elif kind in ("table", "view"):
             t = d["table"]
             view = kind == "view"
             q = session.driver.qualify(t, schema)
             m.addAction("Open Data", lambda: main.open_data(conn, schema, t, view))
-            m.addAction("SELECT Top 100", lambda: main.new_query(conn, schema, f"SELECT *\nFROM {q}\nLIMIT 100;", run=True))
+            top_sql = session.driver.select_limit(f"SELECT *\nFROM {q}", 100) + ";"
+            m.addAction("SELECT Top 100", lambda: main.new_query(conn, schema, top_sql, run=True))
             m.addAction("Show DDL", lambda: main.show_ddl(conn, schema, t))
             if not view:
                 m.addSeparator()
                 m.addAction("Design Table…", lambda: main.design_table(conn, schema, t))
-                m.addAction("Import Data…", lambda: main.import_data(conn, schema, t))
-            m.addAction("Export Data…", lambda: main.export_table(conn, schema, t))
+                m.addAction("Import Data…", gate.guarded("export", lambda: main.import_data(conn, schema, t), self))
+            m.addAction("Export Data…", gate.guarded("export", lambda: main.export_table(conn, schema, t), self))
             m.addSeparator()
             if not view:
                 m.addAction("Empty Table…", lambda: main.truncate_table(conn, schema, t))
